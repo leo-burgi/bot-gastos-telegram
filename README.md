@@ -1,9 +1,8 @@
 # 🤖 Gastos Hormiga Bot - Tu Asistente de Gastos Hormiga
 
-Bot de Telegram **@misgastos_2025_bot** para registrar gastos hormiga y proyectar gastos personales con integración a Google Sheets.
+Bot de Telegram para registrar gastos hormiga y categorizarlos, ayudando a proyectar gastos personales con integración a Google Sheets.
 
 ## 📋 Características
-
 - ✅ Registro rápido de gastos (contado o cuotas)
 - ✅ Permite Múltiples usuarios autorizados 
 - ✅ Integración automática con Google Sheets "Gastos Hormiga"
@@ -14,10 +13,9 @@ Bot de Telegram **@misgastos_2025_bot** para registrar gastos hormiga y proyecta
 - ✅ Compatible con iPhone y Android
 
 
-
 ## 📱 Uso del Bot
 
-### Métodos de Registro
+### 2 Métodos de Registro
 
 **1. Formato Rápido:**
 ```
@@ -132,13 +130,9 @@ Si tienes problemas:
 
 ## 🚀 Próximas Mejoras (Opcional)
 
-- [ ] Gráficos automáticos en Google Sheets
-- [ ] Alertas de presupuesto
-- [ ] Exportar reportes en PDF
-- [ ] Recordatorios de registro diario
-- [ ] Categorización automática con IA
-- [ ] Multi-moneda
-
+[ ] Refactorización Crítica: Eliminar las funciones _refrescar_resumen y _refrescar_proyeccion del código Python y delegar esos cálculos a Tablas Dinámicas nativas de Google Sheets para evitar cuellos de botella en la API.
+[ ] Conexión a Looker Studio para visualización de gráficos dinámicos y métricas de consumo.
+[ ] Módulo para registro de ingresos (para balance).
 ---
 
 ## 📄 Licencia
