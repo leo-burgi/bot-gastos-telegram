@@ -353,7 +353,7 @@ async def arrancar_gasto_guiado(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def agarrar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['categoria_elegida'] = update.message.text.strip().title()
-    await update.message.reply_text("💵 ¿Cuánta gastaste? (Solo números):")
+    await update.message.reply_text("💵 ¿Cuánta plata gastaste? (Solo números):")
     return PASO_PLATA
 
 async def agarrar_plata(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,7 +391,9 @@ async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT
         )
         
         if todo_ok:
-            mensaje = f"✅ *Anotado*\n{context.user_data['categoria_elegida']} - ${context.user_data['plata_gastada']:.2f}"
+
+            mensaje = f"🐜 *Nuevo Gasto registrado*\n
+            {context.user_data['categoria_elegida']}\n {context.user_data['detalle_compra']} - ${context.user_data['plata_gastada']:.2f}"
         else:
             mensaje = "❌ Error guardando en Google Sheets."
         
