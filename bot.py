@@ -80,10 +80,10 @@ class BotDeGastos:
             hoja_futuro.append_row(['Mes', 'Cuotas Pendientes', 'Monto Estimado', 'Nuevos Gastos', 'Total Proyectado'])
 
     def _anotar_gasto_sync(self, nombre_user, categoria_gasto, detalle, plata, cant_cuotas):
-        """PASO 3: Lógica sincrónica mejorada con inserción en lotes"""
+        """PASO 3: Lógica sincrónica mejorada con inserción en lotes (batching)"""
         try:
             pestaña_gastos = self.planillita.worksheet('Gastos')
-            # Usa nuestra zona horaria 
+            # Usamos nuestra zona horaria para que no haya desfasajes
             ahora = datetime.now(ZONA_HORARIA)
             fecha_texto = ahora.strftime('%Y-%m-%d %H:%M:%S')
             
@@ -102,10 +102,10 @@ class BotDeGastos:
                            cant_cuotas, numero_cuota+1, plata_por_mes, mes_del_tarjetazo, id_casero]
                     filas_a_insertar.append(fila)
             
-            #Guarda las 12 cuotas en UNA sola llamada a la API
+            # ¡Magia! Guardamos las 12 cuotas en UNA sola llamada a la API
             pestaña_gastos.append_rows(filas_a_insertar)
             
-            # Refresca tablas
+            # Refrescamos tablas
             self._refrescar_resumen()
             self._refrescar_proyeccion()
             return True
@@ -117,7 +117,108 @@ class BotDeGastos:
         """Llama al guardado de Google en un hilo separado"""
         return await asyncio.to_thread(self._anotar_gasto_sync, nombre_user, categoria_gasto, detalle, plata, cant_cuotas)
     
+    def _refrescar_resumen(self):
+        """Recalcula el resumen. Optimizado para hacer solo 2 llamadas a la API."""
+        try:
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            pestaña_resumen = self.planillita.worksheet('Resumen Mensual')
+            
+            todos_los_gastos = pestaña_gastos.get_all_records()
+            datos_por_mes = {}
+            
+            for item in todos_los_gastos:
+                mes = str(item.get('Mes Impacto', ''))
+                if not mes: continue # Previene errores si hay filas vacías
+                
+                if mes not in datos_por_mes:
+                    datos_por_mes[mes] = {'total': 0, 'contado': 0, 'cuotas': 0, 'categorias': {}}
+                
+                plata = float(item.get('Monto Cuota') or 0)
+                datos_por_mes[mes]['total'] += plata
+                
+                if item.get('Cuotas') == 1:
+                    datos_por_mes[mes]['contado'] += plata
+                else:
+                    datos_por_mes[mes]['cuotas'] += plata
+                
+                rubro = item.get('Categoría', 'Sin Categoría')
+                if rubro not in datos_por_mes[mes]['categorias']:
+                    datos_por_mes[mes]['categorias'][rubro] = 0
+                datos_por_mes[mes]['categorias'][rubro] += plata
+            
+            # Armamos una matriz con los nuevos datos
+            nuevos_datos = [['Mes', 'Total Gastos', 'Contado', 'Cuotas', 'Categorías Top', 'Detalle']]
+            
+            for mes in sorted(datos_por_mes.keys(), reverse=True):
+                info = datos_por_mes[mes]
+                top_3_rubros = sorted(info['categorias'].items(), key=lambda x: x[1], reverse=True)[:3]
+                texto_top_rubros = ', '.join([f"{r}: ${p:.2f}" for r, p in top_3_rubros])
+                
+                nuevos_datos.append([
+                    mes,
+                    round(info['total'], 2),
+                    round(info['contado'], 2),
+                    round(info['cuotas'], 2),
+                    texto_top_rubros,
+                    f"{len(info['categorias'])} categorías"
+                ])
+            
+            # Borramos y actualizamos de una sola vez
+            pestaña_resumen.clear()
+            pestaña_resumen.update(range_name='A1', values=nuevos_datos)
+            
+        except Exception as e:
+            registro_errores.error(f"Fallo actualizando el resumen: {e}")
     
+    def _refrescar_proyeccion(self):
+        """Igual optimización de API que el resumen."""
+        try:
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            pestaña_futuro = self.planillita.worksheet('Proyección')
+            
+            todos_los_gastos = pestaña_gastos.get_all_records()
+            futuro = {}
+            ahora = datetime.now(ZONA_HORARIA)
+            
+            for i in range(12):
+                mes_futuro = (ahora + relativedelta(months=i)).strftime('%Y-%m')
+                futuro[mes_futuro] = {'cuotas_pendientes': 0, 'monto_cuotas': 0}
+            
+            for item in todos_los_gastos:
+                mes = str(item.get('Mes Impacto', ''))
+                if mes in futuro:
+                    plata = float(item.get('Monto Cuota') or 0)
+                    if int(item.get('Cuotas', 1)) > 1:
+                        futuro[mes]['cuotas_pendientes'] += 1
+                        futuro[mes]['monto_cuotas'] += plata
+            
+            gastos_pasados = []
+            for i in range(1, 4):
+                mes_anterior = (ahora - relativedelta(months=i)).strftime('%Y-%m')
+                gastos_filtrados = [g for g in todos_los_gastos if g.get('Mes Impacto') == mes_anterior and g.get('Cuota Actual') == 1]
+                suma_mes = sum([float(g.get('Monto Cuota') or 0) for g in gastos_filtrados])
+                gastos_pasados.append(suma_mes)
+            
+            promedio_efectivo = sum(gastos_pasados) / len(gastos_pasados) if gastos_pasados else 0
+            
+            nuevos_datos = [['Mes', 'Cuotas Pendientes', 'Monto Cuotas', 'Promedio Nuevos', 'Total Proyectado']]
+            
+            for mes in sorted(futuro.keys()):
+                info = futuro[mes]
+                estimado_final = info['monto_cuotas'] + promedio_efectivo
+                nuevos_datos.append([
+                    mes,
+                    info['cuotas_pendientes'],
+                    round(info['monto_cuotas'], 2),
+                    round(promedio_efectivo, 2),
+                    round(estimado_final, 2)
+                ])
+                
+            pestaña_futuro.clear()
+            pestaña_futuro.update(range_name='A1', values=nuevos_datos)
+            
+        except Exception as e:
+            registro_errores.error(f"Fallo calculando el futuro: {e}")
     
     def _sacar_resumen_del_mes_sync(self):
         """Saca los números para el mensajito de Telegram"""
@@ -204,7 +305,7 @@ async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mostrar_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Calculando (no te asustes)...")
     
-    # AWAIT importante: Espera sin colgar al resto del bot
+    # AWAIT importante: Esperamos sin colgar al resto del bot
     info_mes = await bot_app.sacar_resumen_async()
     
     if info_mes:
@@ -252,14 +353,14 @@ async def arrancar_gasto_guiado(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def agarrar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['categoria_elegida'] = update.message.text.strip().title()
-    await update.message.reply_text("💵 ¿Cuánta guita dolió? (Solo números):")
+    await update.message.reply_text("💵 ¿Cuánta gastaste? (Solo números):")
     return PASO_PLATA
 
 async def agarrar_plata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         plata = float(update.message.text.strip().replace(',', '.'))
         context.user_data['plata_gastada'] = plata
-        await update.message.reply_text("📝 Contame qué compraste:")
+        await update.message.reply_text("📝 ¿Qué compraste?:")
         return PASO_DETALLE
     except ValueError:
         await update.message.reply_text("❌ Pasame un número válido. Sin letras.")
@@ -267,7 +368,7 @@ async def agarrar_plata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def agarrar_detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['detalle_compra'] = update.message.text.strip()
-    await update.message.reply_text("💳 ¿En cuántos pagos lo hiciste? (1 para contado):")
+    await update.message.reply_text("💳 ¿En cuántas cuotas? (1 para contado):")
     return PASO_CUOTAS
 
 async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,8 +380,6 @@ async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT
         
         usuario = update.effective_user
         nombre_pantalla = usuario.username or usuario.first_name
-        
-        await update.message.reply_text("⏳ Guardando en la planilla...")
         
         # AWAIT: Escribir en Sheets sin bloquear
         todo_ok = await bot_app.anotar_gasto_async(
@@ -332,12 +431,10 @@ async def leer_mensaje_al_toque(update: Update, context: ContextTypes.DEFAULT_TY
             usuario = update.effective_user
             nombre_pantalla = usuario.username or usuario.first_name
             
-            await update.message.reply_text("⏳ Anotando...")
-            
             # AWAIT: Escribir sin bloquear
             todo_ok = await bot_app.anotar_gasto_async(
                 nombre_user=nombre_pantalla,
-                categoria_gasto='General',
+                categoria_gasto='Sin clasificar',
                 detalle=descripcion,
                 plata=plata,
                 cant_cuotas=cuotas
@@ -351,8 +448,7 @@ async def leer_mensaje_al_toque(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             registro_errores.error(f"Error procesando mensaje rápido: {e}")
             await update.message.reply_text("❌ Usá: <plata> <qué es> [cuotas]")
-    else:
-        await update.message.reply_text("No entendí 🤔. Tocá un botón o mandame algo como: 5000 Alfajores")
+
 
 async def principal_async():
     """Arranque del sistema (ahora también asincrónico)"""
