@@ -214,7 +214,7 @@ async def mostrar_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         mensaje = (
             f"📊 *Tu mes de {info_mes['mes']}*\n\n"
-            f"💰 Total patinado: ${info_mes['total']:.2f}\n"
+            f"💰 Total gastado: ${info_mes['total']:.2f}\n"
             f"💵 Taca Taca: ${info_mes['contado']:.2f}\n"
             f"💳 Tarjetazos: ${info_mes['cuotas']:.2f}\n"
             f"📝 Transacciones: {info_mes['cantidad']}\n\n"
