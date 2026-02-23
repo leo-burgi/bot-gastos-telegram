@@ -392,8 +392,11 @@ async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT
         
         if todo_ok:
 
-            mensaje = f"🐜 *Nuevo Gasto registrado*\n
-            {context.user_data['categoria_elegida']}\n {context.user_data['detalle_compra']} - ${context.user_data['plata_gastada']:.2f}"
+            if cuotas == 1:
+            mensaje = f"🐜 *Anotado: ${context.user_data['plata_gastada']:.2f}*\n{context.user_data['categoria_elegida']} | {context.user_data['detalle_compra']}"
+        else:
+            monto_cuota = context.user_data['plata_gastada'] / cuotas
+            mensaje = f"🐜 *Anotado: ${context.user_data['plata_gastada']:.2f}*\n{context.user_data['categoria_elegida']} | {context.user_data['detalle_compra']} ({cuotas} cuotas de ${monto_cuota:.2f})"
         else:
             mensaje = "❌ Error guardando en Google Sheets."
         
