@@ -377,36 +377,53 @@ async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT
         if cuotas < 1:
             await update.message.reply_text("❌ Minimo 1 cuota.")
             return PASO_CUOTAS
-        
+
         usuario = update.effective_user
         nombre_pantalla = usuario.username or usuario.first_name
-        
+
+        # Validación mínima por si falta algo en user_data
+        required_keys = ("categoria_elegida", "detalle_compra", "plata_gastada")
+        if not all(k in context.user_data for k in required_keys):
+            await update.message.reply_text("❌ Me faltan datos del gasto. Volvé a cargarlo desde el inicio.")
+            context.user_data.clear()
+            return ConversationHandler.END
+
         # AWAIT: Escribir en Sheets sin bloquear
         todo_ok = await bot_app.anotar_gasto_async(
             nombre_user=nombre_pantalla,
-            categoria_gasto=context.user_data['categoria_elegida'],
-            detalle=context.user_data['detalle_compra'],
-            plata=context.user_data['plata_gastada'],
+            categoria_gasto=context.user_data["categoria_elegida"],
+            detalle=context.user_data["detalle_compra"],
+            plata=context.user_data["plata_gastada"],
             cant_cuotas=cuotas
         )
-        
+
         if todo_ok:
+            plata = context.user_data["plata_gastada"]
+            categoria = context.user_data["categoria_elegida"]
+            detalle = context.user_data["detalle_compra"]
 
             if cuotas == 1:
-            mensaje = f"🐜 *Anotado: ${context.user_data['plata_gastada']:.2f}*\n{context.user_data['categoria_elegida']} | {context.user_data['detalle_compra']}"
-        else:
-            monto_cuota = context.user_data['plata_gastada'] / cuotas
-            mensaje = f"🐜 *Anotado: ${context.user_data['plata_gastada']:.2f}*\n{context.user_data['categoria_elegida']} | {context.user_data['detalle_compra']} ({cuotas} cuotas de ${monto_cuota:.2f})"
+                mensaje = (
+                    f"🐜 *Anotado: ${plata:.2f}*\n"
+                    f"{categoria} | {detalle}"
+                )
+            else:
+                monto_cuota = plata / cuotas
+                mensaje = (
+                    f"🐜 *Anotado: ${plata:.2f}*\n"
+                    f"{categoria} | {detalle} ({cuotas} cuotas de ${monto_cuota:.2f})"
+                )
         else:
             mensaje = "❌ Error guardando en Google Sheets."
-        
-        await update.message.reply_text(mensaje, parse_mode='Markdown')
+
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
         context.user_data.clear()
         return ConversationHandler.END
-        
+
     except ValueError:
         await update.message.reply_text("❌ Pasame un número entero para las cuotas.")
         return PASO_CUOTAS
+
 
 async def tirar_todo_al_tacho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
