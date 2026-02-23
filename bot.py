@@ -1,6 +1,8 @@
 import os
 import logging
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import gspread
@@ -9,605 +11,489 @@ from dateutil.relativedelta import relativedelta
 import json
 import re
 
-# Configuración de logging
+# Configuración de logging para ver errores en consola
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+registro_errores = logging.getLogger(__name__)
 
-# Estados de la conversación
-CATEGORIA, MONTO, DESCRIPCION, CUOTAS = range(4)
+# Estados para la máquina de conversación
+PASO_CATEGORIA, PASO_PLATA, PASO_DETALLE, PASO_CUOTAS = range(4)
 
-# Configuración de Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+# Permisos de Google
+PERMISOS_API = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
-class GastosBot:
+# PASO 1: FIJAR LA ZONA HORARIA
+ZONA_HORARIA = ZoneInfo("America/Argentina/Buenos_Aires")
+
+class BotDeGastos:
     def __init__(self):
-        self.creds = None
-        self.client = None
-        self.sheet = None
-        self.usuarios_autorizados = os.getenv('USUARIOS_AUTORIZADOS', '').split(',')
+        self.credenciales = None
+        self.cliente_api = None
+        self.planillita = None
+        self.gente_permitida = os.getenv('USUARIOS_AUTORIZADOS', '').split(',')
         
-    def inicializar_google_sheets(self):
-        """Inicializa la conexión con Google Sheets"""
+    def _conectar_google_sync(self):
+        """Función bloqueante (sincrónica) que hace el trabajo sucio de conectar."""
         try:
-            # Lee las credenciales del archivo JSON
-            creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-            if creds_json:
-                creds_dict = json.loads(creds_json)
-                self.creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+            creds_en_texto = os.getenv('GOOGLE_CREDENTIALS_JSON')
+            if creds_en_texto:
+                creds_diccionario = json.loads(creds_en_texto)
+                self.credenciales = Credentials.from_service_account_info(creds_diccionario, scopes=PERMISOS_API)
             else:
-                self.creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+                self.credenciales = Credentials.from_service_account_file('credentials.json', scopes=PERMISOS_API)
             
-            self.client = gspread.authorize(self.creds)
+            self.cliente_api = gspread.authorize(self.credenciales)
             
-            # Abre o crea la hoja de cálculo
-            spreadsheet_id = os.getenv('SPREADSHEET_ID')
-            if spreadsheet_id:
-                self.sheet = self.client.open_by_key(spreadsheet_id)
+            id_planilla = os.getenv('SPREADSHEET_ID')
+            if id_planilla:
+                self.planillita = self.cliente_api.open_by_key(id_planilla)
             else:
-                self.sheet = self.client.open('Gastos Hormiga')
+                self.planillita = self.cliente_api.open('Gastos Hormiga')
             
-            # Verifica o crea las hojas necesarias
-            self._verificar_hojas()
-            
-            logger.info("Google Sheets inicializado correctamente")
+            self._armar_hojas_si_no_existen()
             return True
         except Exception as e:
-            logger.error(f"Error al inicializar Google Sheets: {e}")
+            registro_errores.error(f"Se rompió la conexión a Google: {e}")
             return False
-    
-    def _verificar_hojas(self):
-        """Verifica que existan las hojas necesarias y las crea si no existen"""
-        hojas_necesarias = ['Gastos', 'Resumen Mensual', 'Proyección']
-        hojas_existentes = [ws.title for ws in self.sheet.worksheets()]
-        
-        # Crear hoja de Gastos
-        if 'Gastos' not in hojas_existentes:
-            gastos_ws = self.sheet.add_worksheet(title='Gastos', rows=1000, cols=10)
-            gastos_ws.append_row(['Fecha', 'Usuario', 'Categoría', 'Descripción', 'Monto', 
-                                 'Cuotas', 'Cuota Actual', 'Monto Cuota', 'Mes Impacto', 'ID'])
-        
-        # Crear hoja de Resumen Mensual
-        if 'Resumen Mensual' not in hojas_existentes:
-            resumen_ws = self.sheet.add_worksheet(title='Resumen Mensual', rows=100, cols=6)
-            resumen_ws.append_row(['Mes', 'Total Gastos', 'Contado', 'Cuotas', 'Categorías', 'Detalle'])
-        
-        # Crear hoja de Proyección
-        if 'Proyección' not in hojas_existentes:
-            proyeccion_ws = self.sheet.add_worksheet(title='Proyección', rows=100, cols=5)
-            proyeccion_ws.append_row(['Mes', 'Cuotas Pendientes', 'Monto Estimado', 'Nuevos Gastos', 'Total Proyectado'])
 
-    def registrar_gasto(self, usuario, categoria, descripcion, monto, cuotas=1):
-        """Registra un gasto en Google Sheets"""
+    async def iniciar_conexion(self):
+        """PASO 2: Envuelve la conexión en un hilo separado para no bloquear el bot."""
+        return await asyncio.to_thread(self._conectar_google_sync)
+    
+    def _armar_hojas_si_no_existen(self):
+        """Revisa las pestañas. Se ejecuta dentro del hilo secundario."""
+        nombres_hojas_actuales = [pestaña.title for pestaña in self.planillita.worksheets()]
+        
+        if 'Gastos' not in nombres_hojas_actuales:
+            hoja_gastos = self.planillita.add_worksheet(title='Gastos', rows=1000, cols=10)
+            hoja_gastos.append_row(['Fecha', 'Usuario', 'Categoría', 'Descripción', 'Monto', 
+                                  'Cuotas', 'Cuota Actual', 'Monto Cuota', 'Mes Impacto', 'ID'])
+        
+        if 'Resumen Mensual' not in nombres_hojas_actuales:
+            hoja_resumen = self.planillita.add_worksheet(title='Resumen Mensual', rows=100, cols=6)
+            hoja_resumen.append_row(['Mes', 'Total Gastos', 'Contado', 'Cuotas', 'Categorías', 'Detalle'])
+            
+        if 'Proyección' not in nombres_hojas_actuales:
+            hoja_futuro = self.planillita.add_worksheet(title='Proyección', rows=100, cols=5)
+            hoja_futuro.append_row(['Mes', 'Cuotas Pendientes', 'Monto Estimado', 'Nuevos Gastos', 'Total Proyectado'])
+
+    def _anotar_gasto_sync(self, nombre_user, categoria_gasto, detalle, plata, cant_cuotas):
+        """PASO 3: Lógica sincrónica mejorada con inserción en lotes"""
         try:
-            gastos_ws = self.sheet.worksheet('Gastos')
-            fecha = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            # Usa nuestra zona horaria 
+            ahora = datetime.now(ZONA_HORARIA)
+            fecha_texto = ahora.strftime('%Y-%m-%d %H:%M:%S')
             
-            if cuotas == 1:
-                # Gasto al contado
-                mes_impacto = datetime.now().strftime('%Y-%m')
-                row = [fecha, usuario, categoria, descripcion, monto, 1, 1, monto, mes_impacto, '']
-                gastos_ws.append_row(row)
+            filas_a_insertar = []
+            
+            if cant_cuotas == 1:
+                mes_del_tarjetazo = ahora.strftime('%Y-%m')
+                fila = [fecha_texto, nombre_user, categoria_gasto, detalle, plata, 1, 1, plata, mes_del_tarjetazo, '']
+                filas_a_insertar.append(fila)
             else:
-                # Gasto en cuotas
-                monto_cuota = round(monto / cuotas, 2)
-                fecha_base = datetime.now()
-                
-                for i in range(cuotas):
-                    mes_impacto = (fecha_base + relativedelta(months=i)).strftime('%Y-%m')
-                    row = [fecha, usuario, categoria, descripcion, monto, 
-                           cuotas, i+1, monto_cuota, mes_impacto, f"{fecha}_{descripcion}"]
-                    gastos_ws.append_row(row)
+                plata_por_mes = round(plata / cant_cuotas, 2)
+                for numero_cuota in range(cant_cuotas):
+                    mes_del_tarjetazo = (ahora + relativedelta(months=numero_cuota)).strftime('%Y-%m')
+                    id_casero = f"{fecha_texto}_{detalle}"
+                    fila = [fecha_texto, nombre_user, categoria_gasto, detalle, plata, 
+                           cant_cuotas, numero_cuota+1, plata_por_mes, mes_del_tarjetazo, id_casero]
+                    filas_a_insertar.append(fila)
             
-            self._actualizar_resumen()
-            self._actualizar_proyeccion()
+            #Guarda las 12 cuotas en UNA sola llamada a la API
+            pestaña_gastos.append_rows(filas_a_insertar)
             
+            # Refresca tablas
+            self._refrescar_resumen()
+            self._refrescar_proyeccion()
             return True
         except Exception as e:
-            logger.error(f"Error al registrar gasto: {e}")
+            registro_errores.error(f"Fallo al querer guardar el gasto: {e}")
             return False
+
+    async def anotar_gasto_async(self, nombre_user, categoria_gasto, detalle, plata, cant_cuotas=1):
+        """Llama al guardado de Google en un hilo separado"""
+        return await asyncio.to_thread(self._anotar_gasto_sync, nombre_user, categoria_gasto, detalle, plata, cant_cuotas)
     
-    def _actualizar_resumen(self):
-        """Actualiza el resumen mensual"""
+    def _refrescar_resumen(self):
+        """Recalcula el resumen. Optimizado para hacer solo 2 llamadas a la API."""
         try:
-            gastos_ws = self.sheet.worksheet('Gastos')
-            resumen_ws = self.sheet.worksheet('Resumen Mensual')
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            pestaña_resumen = self.planillita.worksheet('Resumen Mensual')
             
-            # Obtener todos los gastos
-            gastos = gastos_ws.get_all_records()
+            todos_los_gastos = pestaña_gastos.get_all_records()
+            datos_por_mes = {}
             
-            # Agrupar por mes
-            resumen_meses = {}
-            for gasto in gastos:
-                mes = gasto['Mes Impacto']
-                if mes not in resumen_meses:
-                    resumen_meses[mes] = {
-                        'total': 0,
-                        'contado': 0,
-                        'cuotas': 0,
-                        'categorias': {}
-                    }
+            for item in todos_los_gastos:
+                mes = str(item.get('Mes Impacto', ''))
+                if not mes: continue # Previene errores si hay filas vacías
                 
-                monto_cuota = float(gasto['Monto Cuota']) if gasto['Monto Cuota'] else 0
-                resumen_meses[mes]['total'] += monto_cuota
+                if mes not in datos_por_mes:
+                    datos_por_mes[mes] = {'total': 0, 'contado': 0, 'cuotas': 0, 'categorias': {}}
                 
-                if gasto['Cuotas'] == 1:
-                    resumen_meses[mes]['contado'] += monto_cuota
+                plata = float(item.get('Monto Cuota') or 0)
+                datos_por_mes[mes]['total'] += plata
+                
+                if item.get('Cuotas') == 1:
+                    datos_por_mes[mes]['contado'] += plata
                 else:
-                    resumen_meses[mes]['cuotas'] += monto_cuota
+                    datos_por_mes[mes]['cuotas'] += plata
                 
-                cat = gasto['Categoría']
-                if cat not in resumen_meses[mes]['categorias']:
-                    resumen_meses[mes]['categorias'][cat] = 0
-                resumen_meses[mes]['categorias'][cat] += monto_cuota
+                rubro = item.get('Categoría', 'Sin Categoría')
+                if rubro not in datos_por_mes[mes]['categorias']:
+                    datos_por_mes[mes]['categorias'][rubro] = 0
+                datos_por_mes[mes]['categorias'][rubro] += plata
             
-            # Limpiar y actualizar resumen
-            resumen_ws.clear()
-            resumen_ws.append_row(['Mes', 'Total Gastos', 'Contado', 'Cuotas', 'Categorías Top', 'Detalle'])
+            # Arma matriz con los nuevos datos
+            nuevos_datos = [['Mes', 'Total Gastos', 'Contado', 'Cuotas', 'Categorías Top', 'Detalle']]
             
-            for mes in sorted(resumen_meses.keys(), reverse=True):
-                datos = resumen_meses[mes]
-                categorias_top = sorted(datos['categorias'].items(), key=lambda x: x[1], reverse=True)[:3]
-                cats_str = ', '.join([f"{cat}: ${monto:.2f}" for cat, monto in categorias_top])
+            for mes in sorted(datos_por_mes.keys(), reverse=True):
+                info = datos_por_mes[mes]
+                top_3_rubros = sorted(info['categorias'].items(), key=lambda x: x[1], reverse=True)[:3]
+                texto_top_rubros = ', '.join([f"{r}: ${p:.2f}" for r, p in top_3_rubros])
                 
-                resumen_ws.append_row([
+                nuevos_datos.append([
                     mes,
-                    round(datos['total'], 2),
-                    round(datos['contado'], 2),
-                    round(datos['cuotas'], 2),
-                    cats_str,
-                    f"{len(datos['categorias'])} categorías"
+                    round(info['total'], 2),
+                    round(info['contado'], 2),
+                    round(info['cuotas'], 2),
+                    texto_top_rubros,
+                    f"{len(info['categorias'])} categorías"
                 ])
             
+            # Borra y actualiza de una sola vez
+            pestaña_resumen.clear()
+            pestaña_resumen.update(range_name='A1', values=nuevos_datos)
+            
         except Exception as e:
-            logger.error(f"Error al actualizar resumen: {e}")
+            registro_errores.error(f"Fallo actualizando el resumen: {e}")
     
-    def _actualizar_proyeccion(self):
-        """Actualiza la proyección de gastos futuros"""
+    def _refrescar_proyeccion(self):
+        """Igual optimización de API que el resumen."""
         try:
-            gastos_ws = self.sheet.worksheet('Gastos')
-            proyeccion_ws = self.sheet.worksheet('Proyección')
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            pestaña_futuro = self.planillita.worksheet('Proyección')
             
-            # Obtener todos los gastos
-            gastos = gastos_ws.get_all_records()
-            
-            # Proyectar próximos 12 meses
-            proyeccion = {}
-            fecha_actual = datetime.now()
+            todos_los_gastos = pestaña_gastos.get_all_records()
+            futuro = {}
+            ahora = datetime.now(ZONA_HORARIA)
             
             for i in range(12):
-                mes = (fecha_actual + relativedelta(months=i)).strftime('%Y-%m')
-                proyeccion[mes] = {
-                    'cuotas_pendientes': 0,
-                    'monto_cuotas': 0,
-                    'items': []
-                }
+                mes_futuro = (ahora + relativedelta(months=i)).strftime('%Y-%m')
+                futuro[mes_futuro] = {'cuotas_pendientes': 0, 'monto_cuotas': 0}
             
-            # Calcular cuotas pendientes
-            for gasto in gastos:
-                mes_impacto = gasto['Mes Impacto']
-                if mes_impacto in proyeccion:
-                    monto_cuota = float(gasto['Monto Cuota']) if gasto['Monto Cuota'] else 0
-                    if gasto['Cuotas'] > 1:
-                        proyeccion[mes_impacto]['cuotas_pendientes'] += 1
-                        proyeccion[mes_impacto]['monto_cuotas'] += monto_cuota
-                        proyeccion[mes_impacto]['items'].append(f"{gasto['Descripción']} (cuota {gasto['Cuota Actual']}/{gasto['Cuotas']})")
+            for item in todos_los_gastos:
+                mes = str(item.get('Mes Impacto', ''))
+                if mes in futuro:
+                    plata = float(item.get('Monto Cuota') or 0)
+                    if int(item.get('Cuotas', 1)) > 1:
+                        futuro[mes]['cuotas_pendientes'] += 1
+                        futuro[mes]['monto_cuotas'] += plata
             
-            # Actualizar hoja
-            proyeccion_ws.clear()
-            proyeccion_ws.append_row(['Mes', 'Cuotas Pendientes', 'Monto Cuotas', 'Promedio Nuevos', 'Total Proyectado'])
-            
-            # Calcular promedio de gastos nuevos (últimos 3 meses)
-            meses_pasados = []
+            gastos_pasados = []
             for i in range(1, 4):
-                mes_pasado = (fecha_actual - relativedelta(months=i)).strftime('%Y-%m')
-                gastos_mes = [g for g in gastos if g['Mes Impacto'] == mes_pasado and g['Cuota Actual'] == 1]
-                total_mes = sum([float(g['Monto Cuota']) for g in gastos_mes if g['Monto Cuota']])
-                meses_pasados.append(total_mes)
+                mes_anterior = (ahora - relativedelta(months=i)).strftime('%Y-%m')
+                gastos_filtrados = [g for g in todos_los_gastos if g.get('Mes Impacto') == mes_anterior and g.get('Cuota Actual') == 1]
+                suma_mes = sum([float(g.get('Monto Cuota') or 0) for g in gastos_filtrados])
+                gastos_pasados.append(suma_mes)
             
-            promedio_nuevos = sum(meses_pasados) / len(meses_pasados) if meses_pasados else 0
+            promedio_efectivo = sum(gastos_pasados) / len(gastos_pasados) if gastos_pasados else 0
             
-            for mes in sorted(proyeccion.keys()):
-                datos = proyeccion[mes]
-                total_proyectado = datos['monto_cuotas'] + promedio_nuevos
-                
-                proyeccion_ws.append_row([
+            nuevos_datos = [['Mes', 'Cuotas Pendientes', 'Monto Cuotas', 'Promedio Nuevos', 'Total Proyectado']]
+            
+            for mes in sorted(futuro.keys()):
+                info = futuro[mes]
+                estimado_final = info['monto_cuotas'] + promedio_efectivo
+                nuevos_datos.append([
                     mes,
-                    datos['cuotas_pendientes'],
-                    round(datos['monto_cuotas'], 2),
-                    round(promedio_nuevos, 2),
-                    round(total_proyectado, 2)
+                    info['cuotas_pendientes'],
+                    round(info['monto_cuotas'], 2),
+                    round(promedio_efectivo, 2),
+                    round(estimado_final, 2)
                 ])
+                
+            pestaña_futuro.clear()
+            pestaña_futuro.update(range_name='A1', values=nuevos_datos)
             
         except Exception as e:
-            logger.error(f"Error al actualizar proyección: {e}")
+            registro_errores.error(f"Fallo calculando el futuro: {e}")
     
-    def obtener_resumen_mes_actual(self):
-        """Obtiene el resumen del mes actual"""
+    def _sacar_resumen_del_mes_sync(self):
+        """Saca los números para el mensajito de Telegram"""
         try:
-            mes_actual = datetime.now().strftime('%Y-%m')
-            gastos_ws = self.sheet.worksheet('Gastos')
-            gastos = gastos_ws.get_all_records()
+            este_mes = datetime.now(ZONA_HORARIA).strftime('%Y-%m')
+            pestaña_gastos = self.planillita.worksheet('Gastos')
+            todos_los_gastos = pestaña_gastos.get_all_records()
             
-            gastos_mes = [g for g in gastos if g['Mes Impacto'] == mes_actual]
+            gastos_ahora = [g for g in todos_los_gastos if g.get('Mes Impacto') == este_mes]
             
-            total = sum([float(g['Monto Cuota']) for g in gastos_mes if g['Monto Cuota']])
-            contado = sum([float(g['Monto Cuota']) for g in gastos_mes if g['Monto Cuota'] and g['Cuotas'] == 1])
-            cuotas = total - contado
+            total_plata = sum([float(g.get('Monto Cuota') or 0) for g in gastos_ahora])
+            plata_contado = sum([float(g.get('Monto Cuota') or 0) for g in gastos_ahora if g.get('Cuotas') == 1])
+            plata_cuotas = total_plata - plata_contado
             
-            # Categorías
-            categorias = {}
-            for gasto in gastos_mes:
-                cat = gasto['Categoría']
-                monto = float(gasto['Monto Cuota']) if gasto['Monto Cuota'] else 0
-                if cat not in categorias:
-                    categorias[cat] = 0
-                categorias[cat] += monto
+            rubros = {}
+            for item in gastos_ahora:
+                r = item.get('Categoría', 'General')
+                plata = float(item.get('Monto Cuota') or 0)
+                if r not in rubros: rubros[r] = 0
+                rubros[r] += plata
             
             return {
-                'mes': mes_actual,
-                'total': total,
-                'contado': contado,
-                'cuotas': cuotas,
-                'cantidad': len(gastos_mes),
-                'categorias': categorias
+                'mes': este_mes,
+                'total': total_plata,
+                'contado': plata_contado,
+                'cuotas': plata_cuotas,
+                'cantidad': len(gastos_ahora),
+                'categorias': rubros
             }
         except Exception as e:
-            logger.error(f"Error al obtener resumen: {e}")
+            registro_errores.error(f"Error sacando la data del mes: {e}")
             return None
 
-# Instancia global del bot
-gastos_bot = GastosBot()
+    async def sacar_resumen_async(self):
+        return await asyncio.to_thread(self._sacar_resumen_del_mes_sync)
 
-# Funciones de comandos
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start"""
-    user = update.effective_user
-    username = user.username or user.first_name
+    def _sacar_futuro_sync(self):
+        try:
+            return self.planillita.worksheet('Proyección').get_all_records()
+        except Exception as e:
+            registro_errores.error(f"Error leyendo la proyeccion: {e}")
+            return None
+
+    async def sacar_futuro_async(self):
+        return await asyncio.to_thread(self._sacar_futuro_sync)
+
+# Instancio el botcito en memoria
+bot_app = BotDeGastos()
+
+# === FUNCIONES DE TELEGRAM (HANDLERS) ===
+
+async def arrancar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usuario = update.effective_user
+    nombre_pantalla = usuario.username or usuario.first_name
     
-    # Verificar si el usuario está autorizado
-    if str(user.id) not in gastos_bot.usuarios_autorizados and len(gastos_bot.usuarios_autorizados) > 0:
-        await update.message.reply_text(
-            "❌ No tienes autorización para usar este bot.\n"
-            f"Tu ID de usuario es: {user.id}\n"
-            "Contacta al administrador para obtener acceso."
-        )
+    if str(usuario.id) not in bot_app.gente_permitida and len(bot_app.gente_permitida) > 0:
+        await update.message.reply_text(f"❌ Acceso denegado. Tu ID es: {usuario.id}")
         return ConversationHandler.END
     
-    keyboard = [
+    botonera = [
         [KeyboardButton("💰 Nuevo Gasto"), KeyboardButton("📊 Resumen Mes")],
         [KeyboardButton("📈 Proyección"), KeyboardButton("❓ Ayuda")]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    teclado_visual = ReplyKeyboardMarkup(botonera, resize_keyboard=True)
     
     await update.message.reply_text(
-        f"¡Hola {username}! 👋\n\n"
-        "Soy tu asistente para registrar gastos hormiga.\n\n"
-        "Puedes:\n"
-        "• Registrar gastos al contado o en cuotas\n"
-        "• Ver el resumen mensual\n"
-        "• Consultar la proyección de gastos futuros\n\n"
-        "Usa los botones o envía un gasto con formato:\n"
+        f"¡Qué onda {nombre_pantalla}! 👋\n\n"
+        "Manejo tus gastos al toque.\n"
+        "Usa los botones o mandame:\n"
         "💵 <monto> <descripción> [cuotas]\n\n"
-        "Ejemplos:\n"
-        "• 500 Almuerzo\n"
-        "• 12000 Auriculares 6 (6 cuotas)",
-        reply_markup=reply_markup
+        "Ejemplo: 5000 Birra",
+        reply_markup=teclado_visual
     )
 
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /ayuda"""
+async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Guía de Uso*\n\n"
-        "*Registrar gasto rápido:*\n"
-        "💵 <monto> <descripción> [cuotas]\n"
-        "Ejemplos:\n"
-        "• 500 Almuerzo\n"
-        "• 3500 Zapatillas 3\n\n"
-        "*Botones disponibles:*\n"
-        "• 💰 Nuevo Gasto: Registro guiado paso a paso\n"
-        "• 📊 Resumen Mes: Ver gastos del mes actual\n"
-        "• 📈 Proyección: Ver gastos proyectados\n\n"
-        "*Categorías sugeridas:*\n"
-        "Comida, Transporte, Entretenimiento, Salud, "
-        "Ropa, Tecnología, Hogar, Otros\n\n"
-        "*Comandos:*\n"
-        "/start - Iniciar bot\n"
-        "/resumen - Resumen del mes\n"
-        "/proyeccion - Proyección futura\n"
-        "/ayuda - Esta ayuda",
+        "📖 *Ayudín*\n\n"
+        "Carga rápida: 💵 <plata> <qué compraste> [cuotas]\n"
+        "Ejemplo: 35000 Remera 3\n\n"
+        "Si preferís paso a paso, tocá '💰 Nuevo Gasto'.",
         parse_mode='Markdown'
     )
 
-async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el resumen del mes actual"""
-    await update.message.reply_text("📊 Generando resumen...")
+async def mostrar_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Calculando (no te asustes)...")
     
-    resumen = gastos_bot.obtener_resumen_mes_actual()
+    # AWAIT importante: Espera sin colgar al resto del bot
+    info_mes = await bot_app.sacar_resumen_async()
     
-    if resumen:
-        categorias_texto = "\n".join([f"  • {cat}: ${monto:.2f}" 
-                                      for cat, monto in sorted(resumen['categorias'].items(), 
-                                                              key=lambda x: x[1], reverse=True)])
+    if info_mes:
+        texto_rubros = "\n".join([f"  • {rubro}: ${plata:.2f}" 
+                                  for rubro, plata in sorted(info_mes['categorias'].items(), 
+                                                           key=lambda x: x[1], reverse=True)])
         
         mensaje = (
-            f"📊 *Resumen de {resumen['mes']}*\n\n"
-            f"💰 Total gastado: ${resumen['total']:.2f}\n"
-            f"💵 Al contado: ${resumen['contado']:.2f}\n"
-            f"💳 En cuotas: ${resumen['cuotas']:.2f}\n"
-            f"📝 Cantidad de gastos: {resumen['cantidad']}\n\n"
-            f"*Por categoría:*\n{categorias_texto}"
+            f"📊 *Tu mes de {info_mes['mes']}*\n\n"
+            f"💰 Total patinado: ${info_mes['total']:.2f}\n"
+            f"💵 Taca Taca: ${info_mes['contado']:.2f}\n"
+            f"💳 Tarjetazos: ${info_mes['cuotas']:.2f}\n"
+            f"📝 Transacciones: {info_mes['cantidad']}\n\n"
+            f"*Te la gastaste en:*\n{texto_rubros}"
         )
     else:
-        mensaje = "❌ No se pudo obtener el resumen. Intenta de nuevo."
+        mensaje = "❌ Error leyendo la planilla. Probá en un rato."
     
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
-async def proyeccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la proyección de gastos"""
-    await update.message.reply_text("📈 Generando proyección...")
+async def mostrar_futuro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📈 Leyendo el tarot financiero...")
     
-    try:
-        proyeccion_ws = gastos_bot.sheet.worksheet('Proyección')
-        proyeccion_data = proyeccion_ws.get_all_records()
-        
-        mensaje = "📈 *Proyección de Gastos*\n\n"
-        
-        for i, row in enumerate(proyeccion_data[:6]):  # Próximos 6 meses
-            if i == 0:
-                mensaje += f"*{row['Mes']}* (mes actual)\n"
-            else:
-                mensaje += f"*{row['Mes']}*\n"
-            
+    filas = await bot_app.sacar_futuro_async()
+    
+    if filas:
+        mensaje = "📈 *Lo que se te viene*\n\n"
+        for i, fila in enumerate(filas[:6]): 
+            mes_texto = f"*{fila['Mes']}* (Este mes)\n" if i == 0 else f"*{fila['Mes']}*\n"
+            mensaje += mes_texto
             mensaje += (
-                f"  💳 Cuotas: ${row['Monto Cuotas']:.2f} ({row['Cuotas Pendientes']} cuotas)\n"
-                f"  ➕ Nuevos: ${row['Promedio Nuevos']:.2f}\n"
-                f"  📊 Total: ${row['Total Proyectado']:.2f}\n\n"
+                f"  💳 Tarjeta: ${fila.get('Monto Cuotas', 0):.2f}\n"
+                f"  ➕ Estimado extras: ${fila.get('Promedio Nuevos', 0):.2f}\n"
+                f"  📊 Vas a necesitar: ${fila.get('Total Proyectado', 0):.2f}\n\n"
             )
-        
-        mensaje += "💡 *Promedio Nuevos* se calcula con los últimos 3 meses"
-        
-    except Exception as e:
-        logger.error(f"Error al obtener proyección: {e}")
-        mensaje = "❌ No se pudo obtener la proyección. Intenta de nuevo."
-    
-    await update.message.reply_text(mensaje, parse_mode='Markdown')
+        await update.message.reply_text(mensaje, parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ No pude leer la pestaña de Proyección.")
 
-async def nuevo_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el proceso de registro de un nuevo gasto"""
-    await update.message.reply_text(
-        "💰 *Registrar Nuevo Gasto*\n\n"
-        "¿En qué categoría se encuentra este gasto?\n\n"
-        "Categorías sugeridas:\n"
-        "• Comida\n"
-        "• Transporte\n"
-        "• Entretenimiento\n"
-        "• Salud\n"
-        "• Ropa\n"
-        "• Tecnología\n"
-        "• Hogar\n"
-        "• Otros\n\n"
-        "Escribe la categoría o /cancelar para abortar:",
-        parse_mode='Markdown'
-    )
-    return CATEGORIA
+# === MÁQUINA DE ESTADOS (GUIADA) ===
 
-async def recibir_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe la categoría del gasto"""
-    context.user_data['categoria'] = update.message.text.strip().title()
-    await update.message.reply_text(
-        f"Categoría: *{context.user_data['categoria']}*\n\n"
-        "💵 ¿Cuál es el monto total del gasto?\n"
-        "Ejemplo: 1500",
-        parse_mode='Markdown'
-    )
-    return MONTO
+async def arrancar_gasto_guiado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💰 ¿En qué rubro entra esto? (Comida, Salud, etc.):")
+    return PASO_CATEGORIA
 
-async def recibir_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el monto del gasto"""
+async def agarrar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['categoria_elegida'] = update.message.text.strip().title()
+    await update.message.reply_text("💵 ¿Cuánta guita dolió? (Solo números):")
+    return PASO_PLATA
+
+async def agarrar_plata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        monto = float(update.message.text.strip().replace(',', '.'))
-        context.user_data['monto'] = monto
-        await update.message.reply_text(
-            f"Monto: *${monto:.2f}*\n\n"
-            "📝 ¿Qué compraste o para qué fue el gasto?\n"
-            "Ejemplo: Almuerzo con amigos",
-            parse_mode='Markdown'
-        )
-        return DESCRIPCION
+        plata = float(update.message.text.strip().replace(',', '.'))
+        context.user_data['plata_gastada'] = plata
+        await update.message.reply_text("📝 Contame qué compraste:")
+        return PASO_DETALLE
     except ValueError:
-        await update.message.reply_text(
-            "❌ Monto inválido. Por favor ingresa solo números.\n"
-            "Ejemplo: 1500"
-        )
-        return MONTO
+        await update.message.reply_text("❌ Pasame un número válido. Sin letras.")
+        return PASO_PLATA
 
-async def recibir_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe la descripción del gasto"""
-    context.user_data['descripcion'] = update.message.text.strip()
-    await update.message.reply_text(
-        f"Descripción: *{context.user_data['descripcion']}*\n\n"
-        "💳 ¿En cuántas cuotas?\n"
-        "Escribe 1 para contado o el número de cuotas (ej: 3, 6, 12)",
-        parse_mode='Markdown'
-    )
-    return CUOTAS
+async def agarrar_detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['detalle_compra'] = update.message.text.strip()
+    await update.message.reply_text("💳 ¿En cuántos pagos lo hiciste? (1 para contado):")
+    return PASO_CUOTAS
 
-async def recibir_cuotas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe las cuotas y registra el gasto"""
+async def agarrar_cuotas_y_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cuotas = int(update.message.text.strip())
-        
         if cuotas < 1:
-            await update.message.reply_text("❌ El número de cuotas debe ser al menos 1.")
-            return CUOTAS
+            await update.message.reply_text("❌ Minimo 1 cuota.")
+            return PASO_CUOTAS
         
-        user = update.effective_user
-        username = user.username or user.first_name
+        usuario = update.effective_user
+        nombre_pantalla = usuario.username or usuario.first_name
         
-        # Registrar el gasto
-        exito = gastos_bot.registrar_gasto(
-            usuario=username,
-            categoria=context.user_data['categoria'],
-            descripcion=context.user_data['descripcion'],
-            monto=context.user_data['monto'],
-            cuotas=cuotas
+        await update.message.reply_text("⏳ Guardando en la planilla...")
+        
+        # AWAIT: Escribir en Sheets sin bloquear
+        todo_ok = await bot_app.anotar_gasto_async(
+            nombre_user=nombre_pantalla,
+            categoria_gasto=context.user_data['categoria_elegida'],
+            detalle=context.user_data['detalle_compra'],
+            plata=context.user_data['plata_gastada'],
+            cant_cuotas=cuotas
         )
         
-        if exito:
-            if cuotas == 1:
-                mensaje = (
-                    "✅ *Gasto registrado exitosamente*\n\n"
-                    f"💰 Categoría: {context.user_data['categoria']}\n"
-                    f"💵 Monto: ${context.user_data['monto']:.2f}\n"
-                    f"📝 Descripción: {context.user_data['descripcion']}\n"
-                    f"💳 Tipo: Contado"
-                )
-            else:
-                monto_cuota = context.user_data['monto'] / cuotas
-                mensaje = (
-                    "✅ *Gasto registrado exitosamente*\n\n"
-                    f"💰 Categoría: {context.user_data['categoria']}\n"
-                    f"💵 Monto total: ${context.user_data['monto']:.2f}\n"
-                    f"📝 Descripción: {context.user_data['descripcion']}\n"
-                    f"💳 Cuotas: {cuotas} x ${monto_cuota:.2f}"
-                )
+        if todo_ok:
+            mensaje = f"✅ *Anotado*\n{context.user_data['categoria_elegida']} - ${context.user_data['plata_gastada']:.2f}"
         else:
-            mensaje = "❌ Hubo un error al registrar el gasto. Intenta de nuevo."
+            mensaje = "❌ Error guardando en Google Sheets."
         
         await update.message.reply_text(mensaje, parse_mode='Markdown')
-        
-        # Limpiar datos de usuario
         context.user_data.clear()
-        
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text(
-            "❌ Número de cuotas inválido. Por favor ingresa un número entero.\n"
-            "Ejemplo: 1, 3, 6, 12"
-        )
-        return CUOTAS
+        await update.message.reply_text("❌ Pasame un número entero para las cuotas.")
+        return PASO_CUOTAS
 
-async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancela la operación actual"""
+async def tirar_todo_al_tacho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "❌ Operación cancelada.\n"
-        "Usa /start para volver a comenzar."
-    )
+    await update.message.reply_text("❌ Operación cancelada.")
     return ConversationHandler.END
 
-async def procesar_mensaje_rapido(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Procesa mensajes con formato rápido: monto descripción [cuotas]"""
+# === LECTURA DE TEXTO LIBRE ===
+
+async def leer_mensaje_al_toque(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip()
     
-    # Botones del menú
-    if texto == "💰 Nuevo Gasto":
-        return await nuevo_gasto(update, context)
-    elif texto == "📊 Resumen Mes":
-        return await resumen(update, context)
-    elif texto == "📈 Proyección":
-        return await proyeccion(update, context)
-    elif texto == "❓ Ayuda":
-        return await ayuda(update, context)
+    if texto == "💰 Nuevo Gasto": return await arrancar_gasto_guiado(update, context)
+    elif texto == "📊 Resumen Mes": return await mostrar_resumen(update, context)
+    elif texto == "📈 Proyección": return await mostrar_futuro(update, context)
+    elif texto == "❓ Ayuda": return await tirar_ayuda(update, context)
     
-    # Formato rápido: monto descripción [cuotas]
-    # Buscar patrón: número (puede incluir decimales) seguido de texto
-    patron = r'^(\d+(?:[.,]\d+)?)\s+(.+?)(?:\s+(\d+))?$'
-    match = re.match(patron, texto)
+    # PASO 4: Regex robusto. Permite espacios en blanco de sobra al principio y final.
+    patron_magico = r'^\s*(\d+(?:[.,]\d+)?)\s+(.+?)(?:\s+(\d+))?\s*$'
+    coincidencia = re.match(patron_magico, texto)
     
-    if match:
+    if coincidencia:
         try:
-            monto = float(match.group(1).replace(',', '.'))
-            descripcion = match.group(2).strip()
-            cuotas = int(match.group(3)) if match.group(3) else 1
+            plata = float(coincidencia.group(1).replace(',', '.'))
+            descripcion = coincidencia.group(2).strip()
+            cuotas = int(coincidencia.group(3)) if coincidencia.group(3) else 1
             
-            user = update.effective_user
-            username = user.username or user.first_name
+            usuario = update.effective_user
+            nombre_pantalla = usuario.username or usuario.first_name
             
-            # Registrar con categoría por defecto
-            exito = gastos_bot.registrar_gasto(
-                usuario=username,
-                categoria='General',
-                descripcion=descripcion,
-                monto=monto,
-                cuotas=cuotas
+            await update.message.reply_text("⏳ Anotando...")
+            
+            # AWAIT: Escribir sin bloquear
+            todo_ok = await bot_app.anotar_gasto_async(
+                nombre_user=nombre_pantalla,
+                categoria_gasto='General',
+                detalle=descripcion,
+                plata=plata,
+                cant_cuotas=cuotas
             )
             
-            if exito:
-                if cuotas == 1:
-                    mensaje = (
-                        "✅ *Gasto registrado*\n\n"
-                        f"💵 ${monto:.2f}\n"
-                        f"📝 {descripcion}\n"
-                        f"💳 Contado"
-                    )
-                else:
-                    monto_cuota = monto / cuotas
-                    mensaje = (
-                        "✅ *Gasto registrado*\n\n"
-                        f"💵 ${monto:.2f}\n"
-                        f"📝 {descripcion}\n"
-                        f"💳 {cuotas} cuotas de ${monto_cuota:.2f}"
-                    )
-                
-                await update.message.reply_text(mensaje, parse_mode='Markdown')
+            if todo_ok:
+                await update.message.reply_text(f"✅ *Anotado al toque*\n💵 ${plata:.2f} en {descripcion}", parse_mode='Markdown')
             else:
-                await update.message.reply_text("❌ Error al registrar el gasto.")
-            
+                await update.message.reply_text("❌ Error al guardar.")
+                
         except Exception as e:
-            logger.error(f"Error en mensaje rápido: {e}")
-            await update.message.reply_text(
-                "❌ Formato incorrecto. Usa:\n"
-                "💵 <monto> <descripción> [cuotas]\n\n"
-                "Ejemplos:\n"
-                "• 500 Almuerzo\n"
-                "• 3000 Zapatillas 3"
-            )
+            registro_errores.error(f"Error procesando mensaje rápido: {e}")
+            await update.message.reply_text("❌ Usá: <plata> <qué es> [cuotas]")
     else:
-        await update.message.reply_text(
-            "No entiendo ese mensaje 🤔\n\n"
-            "Usa los botones del menú o escribe:\n"
-            "💵 <monto> <descripción> [cuotas]\n\n"
-            "Ejemplo: 500 Almuerzo"
-        )
+        await update.message.reply_text("No entendí 🤔. Tocá un botón o mandame algo como: 5000 Alfajores")
 
-def main():
-    """Función principal"""
-    # Inicializar Google Sheets
-    if not gastos_bot.inicializar_google_sheets():
-        logger.error("No se pudo inicializar Google Sheets. Verifica las credenciales.")
+async def principal_async():
+    """Arranque del sistema (ahora también asincrónico)"""
+    # AWAIT inicial
+    conectado = await bot_app.iniciar_conexion()
+    if not conectado:
+        registro_errores.error("Me rindo, no conectó a Sheets. Fijate el JSON.")
         return
     
-    # Crear aplicación
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+    app = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
     
-    # Manejador de conversación para nuevo gasto
-    conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^💰 Nuevo Gasto$'), nuevo_gasto)],
+    charla_guiada = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^💰 Nuevo Gasto$'), arrancar_gasto_guiado)],
         states={
-            CATEGORIA: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_categoria)],
-            MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_monto)],
-            DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_descripcion)],
-            CUOTAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_cuotas)],
+            PASO_CATEGORIA: [MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_categoria)],
+            PASO_PLATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_plata)],
+            PASO_DETALLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_detalle)],
+            PASO_CUOTAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_cuotas_y_guardar)],
         },
-        fallbacks=[CommandHandler('cancelar', cancelar)],
+        fallbacks=[CommandHandler('cancelar', tirar_todo_al_tacho)],
     )
     
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ayuda", ayuda))
-    application.add_handler(CommandHandler("resumen", resumen))
-    application.add_handler(CommandHandler("proyeccion", proyeccion))
-    application.add_handler(conv_handler)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje_rapido))
+    app.add_handler(CommandHandler("start", arrancar))
+    app.add_handler(CommandHandler("ayuda", tirar_ayuda))
+    app.add_handler(CommandHandler("resumen", mostrar_resumen))
+    app.add_handler(CommandHandler("proyeccion", mostrar_futuro))
+    app.add_handler(charla_guiada)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, leer_mensaje_al_toque))
     
-    # Iniciar bot
-    logger.info("Bot iniciado...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    registro_errores.info("¡Bot levantado y asincrónico! Escuchando...")
+    
+    # IMPORTANTE: al usar un event loop que nosotros creamos, tenemos que arrancar la app así:
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Mantener vivo el programa
+    stop_event = asyncio.Event()
+    await stop_event.wait()
 
 if __name__ == '__main__':
-    main()
+    # Lanzamos el loop asincrónico base
+    asyncio.run(principal_async())
