@@ -1,30 +1,48 @@
-# 🤖 Gastos Hormiga Bot - Tu Asistente de Gastos Hormiga
+# 🤖 Gastos Hormiga Bot - Asistente Personal de Gastos
 
-Bot de Telegram para registrar gastos hormiga y categorizarlos, ayudando a proyectar gastos personales con integración a Google Sheets.
+Bot de Telegram para registrar gastos personales de forma rápida, categorizarlos y consultar resúmenes por mes y categoría usando Google Sheets como base de datos.
+
+El bot está pensado para registrar gastos simples, cotidianos y personales. Todos los gastos se guardan automáticamente en 1 cuota.
+
+---
 
 ## 📋 Características
-- ✅ Registro rápido de gastos (contado o cuotas)
-- ✅ Permite Múltiples usuarios autorizados 
-- ✅ Integración automática con Google Sheets "Gastos Hormiga"
-- ✅ Resumen mensual detallado por categorías
-- ✅ Proyección de gastos futuros (12 meses)
-- ✅ Cálculo automático de cuotas pendientes
-- ✅ Hosting gratuito 24/7 (Railway)
+
+- ✅ Registro rápido de gastos desde Telegram
+- ✅ Registro guiado con categoría personalizada
+- ✅ Todos los gastos se guardan automáticamente en 1 cuota
+- ✅ Usuarios autorizados mediante variable de entorno
+- ✅ Integración automática con Google Sheets
+- ✅ Resumen filtrable por mes
+- ✅ Resumen filtrable por categoría
+- ✅ Consulta de gastos por categoría, por ejemplo: camioneta, comida, salud, hogar
+- ✅ Proyección de gastos futuros
+- ✅ Hosting 24/7 en Railway
 - ✅ Compatible con iPhone y Android
 
+---
 
 ## 📱 Uso del Bot
 
-### 2 Métodos de Registro
+El bot tiene dos formas principales de registrar gastos.
 
-**1. Formato Rápido:**
+---
+
+## 1. Registro Rápido
+
+Sirve para anotar un gasto al instante.
+
+Formato:
+
+```txt
+<monto> <descripción>
 ```
 500 Almuerzo
-3000 Zapatillas 3
-12000 Notebook 12
+3000 Zapatillas 
+12000 Notebook 
 ```
-Formato: `<monto> <descripción> [cuotas]`
-
+Formato: <monto> <descripción> 
+```
 **2. Registro Guiado:**
 - Usa el botón "💰 Nuevo Gasto"
 - Sigue las instrucciones paso a paso
@@ -126,14 +144,6 @@ Si tienes problemas:
 3. Confirma que las APIs de Google estén habilitadas
 4. Verifica que la Google Sheet esté compartida correctamente
 
----
-
-## 🚀 Próximas Mejoras (Opcional)
-
-[ ] Refactorización Crítica: Eliminar las funciones _refrescar_resumen y _refrescar_proyeccion del código Python y delegar esos cálculos a Tablas Dinámicas nativas de Google Sheets para evitar cuellos de botella en la API.
-[ ] Conexión a Looker Studio para visualización de gráficos dinámicos y métricas de consumo.
-[ ] Módulo para registro de ingresos (para balance).
----
 
 ## 📄 Licencia
 
