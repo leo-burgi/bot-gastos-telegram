@@ -328,17 +328,23 @@ class BotDeGastos:
         - ultimo / último
         - YYYY-MM
         - MM/YYYY
+        - todos / todas (devuelve 'ALL')
+        - rango en formato YYYY-MM:YYYY-MM (devuelve ('RANGE', desde, hasta))
         """
         ahora = datetime.now(ZONA_HORARIA)
         texto = normalizar_texto(mes_solicitado)
 
-        if texto in ("", "actual", "este", "este mes", "mes actual"):
+        # Soporte para "todos" los registros
+        if texto in ("", "todos", "todas", "todo", "todos los meses", "all"):
+            return 'ALL'
+
+        if texto in ("actual", "este", "este mes", "mes actual"):
             return ahora.strftime('%Y-%m')
 
         if texto in ("anterior", "pasado", "mes pasado", "mes anterior"):
             return (ahora - relativedelta(months=1)).strftime('%Y-%m')
 
-        if texto in ("ultimo", "ultimo mes", "ultimo registrado"):
+        if texto in ("ultimo", "ultimo mes", "ultimo registrado", "último", "último mes"):
             meses_con_gastos = sorted({
                 str(g.get('Mes Impacto', '')).strip()
                 for g in todos_los_gastos
@@ -350,6 +356,17 @@ class BotDeGastos:
 
             return ahora.strftime('%Y-%m')
 
+        # Rango simple YYYY-MM:YYYY-MM o YYYY-MM..YYYY-MM
+        rango_coinc = re.match(r'^(\d{4}-\d{2})\s*[:.]{1,2}\s*(\d{4}-\d{2})$', texto)
+        if rango_coinc:
+            inicio = rango_coinc.group(1)
+            fin = rango_coinc.group(2)
+            # Validar que inicio <= fin
+            if inicio <= fin:
+                return ('RANGE', inicio, fin)
+            else:
+                return None
+
         if re.match(r'^\d{4}-\d{2}$', texto):
             return texto
 
@@ -360,6 +377,14 @@ class BotDeGastos:
 
             if 1 <= mes <= 12:
                 return f"{anio}-{mes:02d}"
+
+        # Soporte para frases del tipo "desde 2026-01 hasta 2026-03"
+        desde_hasta = re.match(r'^desde\s+(\d{4}-\d{2})\s+hasta\s+(\d{4}-\d{2})$', texto)
+        if desde_hasta:
+            inicio = desde_hasta.group(1)
+            fin = desde_hasta.group(2)
+            if inicio <= fin:
+                return ('RANGE', inicio, fin)
 
         return None
 
@@ -375,7 +400,7 @@ class BotDeGastos:
                 return {
                     'ok': False,
                     'error': 'MES_INVALIDO',
-                    'mensaje': 'Mes inválido. Usá formato YYYY-MM, por ejemplo 2026-05.'
+                    'mensaje': 'Mes inválido. Usá formato YYYY-MM, por ejemplo 2026-05, o "todos", o un rango YYYY-MM:YYYY-MM.'
                 }
 
             categoria_raw = str(categoria_solicitada or "todas").strip()
@@ -390,10 +415,21 @@ class BotDeGastos:
                 "general"
             )
 
-            gastos_del_mes = [
-                g for g in todos_los_gastos
-                if str(g.get('Mes Impacto', '')).strip() == mes
-            ]
+            # Soporte para mes == 'ALL' o ranges
+            if mes == 'ALL':
+                gastos_del_mes = todos_los_gastos
+            elif isinstance(mes, tuple) and mes[0] == 'RANGE':
+                inicio = mes[1]
+                fin = mes[2]
+                gastos_del_mes = [
+                    g for g in todos_los_gastos
+                    if inicio <= str(g.get('Mes Impacto', '')).strip() <= fin
+                ]
+            else:
+                gastos_del_mes = [
+                    g for g in todos_los_gastos
+                    if str(g.get('Mes Impacto', '')).strip() == mes
+                ]
 
             if filtrar_categoria:
                 gastos_filtrados = [
@@ -435,9 +471,17 @@ class BotDeGastos:
                 if str(g.get('Categoría', '')).strip()
             })
 
+            # Preparamos la forma en que mostramos el mes al usuario
+            if mes == 'ALL':
+                mes_display = 'Todos'
+            elif isinstance(mes, tuple) and mes[0] == 'RANGE':
+                mes_display = f"{mes[1]}..{mes[2]}"
+            else:
+                mes_display = mes
+
             return {
                 'ok': True,
-                'mes': mes,
+                'mes': mes_display,
                 'categoria': categoria_raw if filtrar_categoria else 'Todas',
                 'total': total,
                 'cantidad': len(gastos_filtrados),
@@ -522,12 +566,17 @@ async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/resumen actual camioneta`\n"
         "`/resumen anterior comida`\n"
         "`/resumen ultimo todas`\n\n"
+        "Ahora también podés usar:\n"
+        "`/resumen todos camioneta`  (todos los registros de la categoría)\n"
+        "`/resumen 2026-01:2026-03 camioneta`  (rango de meses)\n"
+        "Si querés ver todos los movimientos cuando hay más de 15, podés añadir `--all` al final:\n"
+        "`/resumen 2026-05 camioneta --all`\n\n"
         "Nota: todos los gastos se guardan automáticamente en 1 cuota.",
         parse_mode='Markdown'
     )
 
 
-def armar_mensaje_resumen(info):
+def armar_mensaje_resumen(info, mostrar_todos=False):
     if not info.get('ok'):
         return f"❌ {info.get('mensaje', 'No pude calcular el resumen.')}"
 
@@ -546,7 +595,11 @@ def armar_mensaje_resumen(info):
         texto_categorias = "  Sin movimientos."
 
     detalles = info.get('detalles', [])
-    detalles_a_mostrar = detalles[:15]
+
+    if mostrar_todos:
+        detalles_a_mostrar = detalles
+    else:
+        detalles_a_mostrar = detalles[:15]
 
     if detalles_a_mostrar:
         texto_detalles = "\n".join([
@@ -557,8 +610,8 @@ def armar_mensaje_resumen(info):
         texto_detalles = "  Sin gastos para ese filtro."
 
     aviso_limite = ""
-    if len(detalles) > 15:
-        aviso_limite = f"\n\n_Mostré los últimos 15 de {len(detalles)} movimientos._"
+    if len(detalles) > 15 and not mostrar_todos:
+        aviso_limite = f"\n\n_Mostré los últimos 15 de {len(detalles)} movimientos._\nEscribí `/resumen {info.get('mes','') } {info.get('categoria','')} --all` para verlos todos."
 
     return (
         f"📊 *Resumen de {info['mes']}*\n"
@@ -573,7 +626,29 @@ def armar_mensaje_resumen(info):
     )
 
 
-async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT_TYPE, mes, categoria):
+def _parse_categoria_y_flag(texto_categoria_raw):
+    """Devuelve (categoria, mostrar_todos) parseando flags simples en la cadena."""
+    if not texto_categoria_raw:
+        return texto_categoria_raw, False
+
+    texto = texto_categoria_raw.strip()
+    mostrar_todos = False
+
+    # soportar bandera --all
+    if texto.endswith('--all') or texto.endswith('--all '):
+        mostrar_todos = True
+        texto = texto.replace('--all', '').strip()
+
+    # soportar frases en español
+    if re.search(r'\bmostrar todo\b', texto.lower()) or re.search(r'\bver todo\b', texto.lower()):
+        mostrar_todos = True
+        texto = re.sub(r'\bmostrar todo\b', '', texto, flags=re.IGNORECASE).strip()
+        texto = re.sub(r'\bver todo\b', '', texto, flags=re.IGNORECASE).strip()
+
+    return texto, mostrar_todos
+
+
+async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT_TYPE, mes, categoria, mostrar_todos=False):
     await update.message.reply_text("📊 Calculando resumen...")
 
     info = await bot_app.sacar_resumen_async(
@@ -581,7 +656,8 @@ async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT
         categoria_solicitada=categoria
     )
 
-    mensaje = armar_mensaje_resumen(info)
+    # armar mensaje con la opción de mostrar todos los movimientos
+    mensaje = armar_mensaje_resumen(info, mostrar_todos=mostrar_todos)
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
 
@@ -592,13 +668,25 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
     /resumen actual camioneta
     /resumen anterior comida
     /resumen ultimo todas
+    /resumen todos camioneta
+    /resumen 2026-01:2026-03 camioneta
+    /resumen 2026-05 camioneta --all
     """
     args = getattr(context, "args", None) or []
 
     if args:
+        # detectar flag --all al final
+        mostrar_todos = False
+        if '--all' in args:
+            mostrar_todos = True
+            args = [a for a in args if a != '--all']
+
         mes = args[0]
         categoria = " ".join(args[1:]) if len(args) > 1 else "todas"
-        await mostrar_resumen_filtrado(update, context, mes, categoria)
+        categoria, flag_categoria = _parse_categoria_y_flag(categoria)
+        mostrar_todos = mostrar_todos or flag_categoria
+
+        await mostrar_resumen_filtrado(update, context, mes, categoria, mostrar_todos=mostrar_todos)
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -607,7 +695,9 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
         "• `actual`\n"
         "• `anterior`\n"
         "• `ultimo`\n"
-        "• `2026-05`\n\n"
+        "• `2026-05`\n"
+        "• `todos` (todas las fechas)\n"
+        "• `2026-01:2026-03` (rango)\n\n"
         "Escribí una opción:",
         parse_mode='Markdown'
     )
@@ -625,6 +715,8 @@ async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE
         "• `comida`\n"
         "• `salud`\n"
         "• `todas`\n\n"
+        "Si querés ver todos los movimientos cuando hay más de 15, escribí por ejemplo:\n"
+        "`camioneta --all` o `camioneta mostrar todo`\n\n"
         "Escribí la categoría:",
         parse_mode='Markdown'
     )
@@ -634,9 +726,11 @@ async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def agarrar_categoria_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mes = context.user_data.get('resumen_mes', 'actual')
-    categoria = update.message.text.strip()
+    categoria_raw = update.message.text.strip()
 
-    await mostrar_resumen_filtrado(update, context, mes, categoria)
+    categoria, mostrar_todos = _parse_categoria_y_flag(categoria_raw)
+
+    await mostrar_resumen_filtrado(update, context, mes, categoria, mostrar_todos=mostrar_todos)
 
     context.user_data.clear()
     return ConversationHandler.END
