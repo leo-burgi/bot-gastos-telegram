@@ -30,6 +30,7 @@ PERMISOS_API = [
 
 # Zona horaria
 ZONA_HORARIA = ZoneInfo("America/Argentina/Buenos_Aires")
+MAX_TEXTO_MENSAJE_TELEGRAM = 4096
 
 
 def normalizar_texto(texto):
@@ -41,6 +42,66 @@ def normalizar_texto(texto):
     texto = unicodedata.normalize("NFD", texto)
     texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
     return texto
+
+
+def dividir_texto_en_bloques(texto, limite=MAX_TEXTO_MENSAJE_TELEGRAM):
+    """Divide un texto largo en bloques compatibles con Telegram."""
+    if not texto:
+        return []
+
+    if len(texto) <= limite:
+        return [texto]
+
+    bloques = []
+    bloque_actual = ""
+
+    for linea in texto.splitlines():
+        if not linea:
+            if bloque_actual:
+                bloques.append(bloque_actual)
+                bloque_actual = ""
+            continue
+
+        if not bloque_actual:
+            bloque_actual = linea
+            continue
+
+        if len(bloque_actual) + 1 + len(linea) <= limite:
+            bloque_actual = f"{bloque_actual}\n{linea}"
+        else:
+            bloques.append(bloque_actual)
+            bloque_actual = linea
+
+    if bloque_actual:
+        bloques.append(bloque_actual)
+
+    mensajes = []
+    for bloque in bloques:
+        if len(bloque) <= limite:
+            mensajes.append(bloque)
+            continue
+
+        partes = []
+        parte_actual = ""
+
+        for palabra in bloque.split(" "):
+            if not palabra:
+                continue
+
+            if not parte_actual:
+                parte_actual = palabra
+            elif len(parte_actual) + 1 + len(palabra) <= limite:
+                parte_actual = f"{parte_actual} {palabra}"
+            else:
+                partes.append(parte_actual)
+                parte_actual = palabra
+
+        if parte_actual:
+            partes.append(parte_actual)
+
+        mensajes.extend(partes)
+
+    return mensajes
 
 
 class BotDeGastos:
@@ -321,11 +382,9 @@ class BotDeGastos:
     def _normalizar_mes_para_resumen(self, mes_solicitado, todos_los_gastos):
         """
         Acepta:
-        - actual
         - este
         - anterior
         - pasado
-        - ultimo / último
         - YYYY-MM
         - MM/YYYY
         - todos / todas (devuelve 'ALL')
@@ -338,23 +397,11 @@ class BotDeGastos:
         if texto in ("", "todos", "todas", "todo", "todos los meses", "all"):
             return 'ALL'
 
-        if texto in ("actual", "este", "este mes", "mes actual"):
+        if texto in ("este", "este mes", "mes actual"):
             return ahora.strftime('%Y-%m')
 
         if texto in ("anterior", "pasado", "mes pasado", "mes anterior"):
             return (ahora - relativedelta(months=1)).strftime('%Y-%m')
-
-        if texto in ("ultimo", "ultimo mes", "ultimo registrado", "último", "último mes"):
-            meses_con_gastos = sorted({
-                str(g.get('Mes Impacto', '')).strip()
-                for g in todos_los_gastos
-                if str(g.get('Mes Impacto', '')).strip()
-            })
-
-            if meses_con_gastos:
-                return meses_con_gastos[-1]
-
-            return ahora.strftime('%Y-%m')
 
         # Rango simple YYYY-MM:YYYY-MM o YYYY-MM..YYYY-MM
         rango_coinc = re.match(r'^(\d{4}-\d{2})\s*[:.]{1,2}\s*(\d{4}-\d{2})$', texto)
@@ -563,9 +610,8 @@ async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tocá `📊 Resumen` o usá:\n"
         "`/resumen 2026-05 camioneta`\n\n"
         "También podés usar:\n"
-        "`/resumen actual camioneta`\n"
-        "`/resumen anterior comida`\n"
-        "`/resumen ultimo todas`\n\n"
+        "`/resumen este camioneta`\n"
+        "`/resumen anterior comida`\n\n"
         "Ahora también podés usar:\n"
         "`/resumen todos camioneta`  (todos los registros de la categoría)\n"
         "`/resumen 2026-01:2026-03 camioneta`  (rango de meses)\n"
@@ -656,18 +702,24 @@ async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT
         categoria_solicitada=categoria
     )
 
-    # armar mensaje con la opción de mostrar todos los movimientos
     mensaje = armar_mensaje_resumen(info, mostrar_todos=mostrar_todos)
-    await update.message.reply_text(mensaje, parse_mode='Markdown')
+    bloques = dividir_texto_en_bloques(mensaje)
+
+    for indice, bloque in enumerate(bloques):
+        texto_a_enviar = bloque
+
+        if indice > 0:
+            texto_a_enviar = f"🔄 Continuación {indice + 1}/{len(bloques)}\n\n{bloque}"
+
+        await update.message.reply_text(texto_a_enviar, parse_mode='Markdown')
 
 
 async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Permite:
     /resumen 2026-05 camioneta
-    /resumen actual camioneta
+    /resumen este camioneta
     /resumen anterior comida
-    /resumen ultimo todas
     /resumen todos camioneta
     /resumen 2026-01:2026-03 camioneta
     /resumen 2026-05 camioneta --all
@@ -692,9 +744,8 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(
         "📅 ¿Qué mes querés ver?\n\n"
         "Opciones:\n"
-        "• `actual`\n"
+        "• `este`\n"
         "• `anterior`\n"
-        "• `ultimo`\n"
         "• `2026-05`\n"
         "• `todos` (todas las fechas)\n"
         "• `2026-01:2026-03` (rango)\n\n"
@@ -725,7 +776,7 @@ async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def agarrar_categoria_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mes = context.user_data.get('resumen_mes', 'actual')
+    mes = context.user_data.get('resumen_mes', 'este')
     categoria_raw = update.message.text.strip()
 
     categoria, mostrar_todos = _parse_categoria_y_flag(categoria_raw)
