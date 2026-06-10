@@ -657,7 +657,7 @@ def armar_mensaje_resumen(info, mostrar_todos=False):
 
     aviso_limite = ""
     if len(detalles) > 15 and not mostrar_todos:
-        aviso_limite = f"\n\n_Mostré los últimos 15 de {len(detalles)} movimientos._\nEscribí `/resumen {info.get('mes','') } {info.get('categoria','')} --all` para verlos todos."
+        aviso_limite = f"\n\n_Últimos 15 de {len(detalles)} movimientos._\nEscribí `/resumen {info.get('mes','') } {info.get('categoria','')} --all` para verlos todos."
 
     return (
         f"📊 *Resumen de {info['mes']}*\n"
@@ -742,7 +742,7 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "📅 ¿Qué mes querés ver?\n\n"
+        "📅 ¿De qué mes?\n\n"
         "Opciones:\n"
         "• `este`\n"
         "• `anterior`\n"
@@ -760,14 +760,14 @@ async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['resumen_mes'] = update.message.text.strip()
 
     await update.message.reply_text(
-        "🏷 ¿Qué categoría querés ver?\n\n"
+        "🏷 ¿De qué categoría?\n\n"
         "Ejemplos:\n"
         "• `camioneta`\n"
         "• `comida`\n"
         "• `salud`\n"
         "• `todas`\n\n"
-        "Si querés ver todos los movimientos cuando hay más de 15, escribí por ejemplo:\n"
-        "`camioneta --all` o `camioneta mostrar todo`\n\n"
+        "Si querés ver todos los movimientos, escribí, por ejemplo:\n"
+        "`camioneta mostrar todo`\n\n"
         "Escribí la categoría:",
         parse_mode='Markdown'
     )
