@@ -291,3 +291,28 @@ def test_agrupar_registros_con_historial_grande(almacen):
     assert almacen._hojas['Gastos'].registros[:10000] == historicos
     assert len(almacen._hojas['Resumen Mensual'].escrituras) == 1
     assert len(almacen._hojas['Proyección'].escrituras) == 1
+
+
+@pytest.mark.parametrize('texto,categoria,monto,detalle', [
+    ('comida 1400 desayuno', 'comida', 1400, 'desayuno'),
+    ('  comida   1.400,50   desayuno con café  ', 'comida', 1400.5, 'desayuno con café'),
+    ('comida y bebida 1400 desayuno', 'comida y bebida', 1400, 'desayuno'),
+    ('casa 1500.50 artículos de limpieza', 'casa', 1500.5, 'artículos de limpieza'),
+    ('comida 1400 desayuno | café', 'comida', 1400, 'desayuno | café'),
+])
+def test_carga_rapida_con_espacios(almacen, monkeypatch, texto, categoria, monto, detalle):
+    update, context = entorno(almacen, monkeypatch, texto)
+    assert asyncio.run(bot.leer_mensaje_al_toque(update, context)) == bot.ConversationHandler.END
+    fila = almacen._hojas['Gastos'].registros[-1]
+    assert fila['Categoría'] == categoria
+    assert fila['Monto'] == monto
+    assert fila['Descripción'] == detalle
+
+
+@pytest.mark.parametrize('texto', ['comida 1400', 'comida 0 desayuno', 'comida -100 desayuno',
+                                   'comida NaN desayuno', 'comida desayuno', '1400'])
+def test_carga_espacios_invalida_no_guarda(almacen, monkeypatch, texto):
+    update, context = entorno(almacen, monkeypatch, texto)
+    assert asyncio.run(bot.leer_mensaje_al_toque(update, context)) == bot.ConversationHandler.END
+    assert not almacen._hojas['Gastos'].registros
+    assert 'comida 1400 desayuno' in update.message.reply_text.call_args.args[0]

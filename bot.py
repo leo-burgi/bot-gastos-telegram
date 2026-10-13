@@ -653,7 +653,7 @@ async def arrancar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Hola {update.effective_user.first_name} 👋\n"
         "Anotá un gasto con categoría, monto y detalle.\n\n"
-        "Carga rápida: Comida | 8.500,50 | Almuerzo\n"
+        "Carga rápida: comida 1400 desayuno\n"
         "También podés tocar 💰 Nuevo Gasto.\n"
         "El formato anterior, 5000 Nafta, sigue disponible como Sin clasificar.",
         reply_markup=MENU)
@@ -664,8 +664,8 @@ async def arrancar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 Ayuda\n\n"
-        "Carga rápida: categoría | monto | detalle\n"
-        "Ejemplo: Camioneta | 35.000 | Nafta\n"
+        "Carga rápida: categoría monto detalle\n"
+        "Ejemplo: camioneta 35000 nafta\n"
         "Formato anterior: 35000 Nafta (Sin clasificar).\n\n"
         "Carga guiada: 💰 Nuevo Gasto. Solo categoría, monto y detalle.\n"
         "Montos: 1500, 1.500, 1.500,50 o 1500.50.\n"
@@ -1040,19 +1040,27 @@ async def leer_mensaje_al_toque(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Hay un guardado pendiente. Tocá 🔄 Reintentar o /cancelar.")
         return PASO_DETALLE
     try:
-        if '|' in texto:
+        # El primer token numérico separa categoría y detalle; admite categorías compuestas.
+        con_categoria = re.fullmatch(r'([^|]+?)\s+([0-9][0-9.,]*)\s+(.+)', texto, flags=re.DOTALL)
+        primer_token = texto.split(maxsplit=1)[0] if texto else ''
+        if re.fullmatch(r'[0-9][0-9.,]*', primer_token):
+            monto, detalle = texto.split(maxsplit=1)
+            categoria = 'Sin clasificar'
+        elif con_categoria:
+            categoria, monto, detalle = [parte.strip() for parte in con_categoria.groups()]
+        elif '|' in texto:
+            # Compatibilidad con gastos escritos en el formato anterior.
             partes = texto.split('|', 2)
             if len(partes) != 3:
                 raise ValueError("Faltan campos")
             categoria, monto, detalle = [parte.strip() for parte in partes]
         else:
-            monto, detalle = texto.split(maxsplit=1)
-            categoria = 'Sin clasificar'
+            raise ValueError("Usá categoría, monto y detalle")
         if not categoria or len(categoria) > 100 or not detalle or len(detalle) > 2000:
             raise ValueError("Categoría o detalle inválidos")
         plata = parsear_monto(monto)
     except ValueError:
-        await update.message.reply_text("Usá: Comida | 8.500,50 | Almuerzo\nO tocá 💰 Nuevo Gasto.", reply_markup=MENU)
+        await update.message.reply_text("Usá: comida 1400 desayuno\nO tocá 💰 Nuevo Gasto.", reply_markup=MENU)
         return ConversationHandler.END
     context.user_data.update(categoria_elegida=categoria, plata_gastada=plata,
                              detalle_compra=detalle, gasto_id=f"tg-{update.effective_chat.id}-{update.message.message_id}")
