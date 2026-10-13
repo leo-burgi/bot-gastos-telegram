@@ -11,6 +11,13 @@ from dateutil.relativedelta import relativedelta
 import json
 import re
 import unicodedata
+import time
+import threading
+import signal
+from decimal import Decimal, InvalidOperation
+from uuid import uuid4
+from functools import wraps
+from telegram.ext import ApplicationHandlerStop, PicklePersistence
 
 # Configuración de logging para ver errores en consola
 logging.basicConfig(
@@ -33,6 +40,51 @@ ZONA_HORARIA = ZoneInfo("America/Argentina/Buenos_Aires")
 MAX_TEXTO_MENSAJE_TELEGRAM = 4096
 
 
+MENU = ReplyKeyboardMarkup([
+    ["💰 Nuevo Gasto", "📊 Resumen"], ["📈 Proyección", "❓ Ayuda"]
+], resize_keyboard=True)
+CONTROLES = ReplyKeyboardMarkup([["⬅️ Volver", "❌ Cancelar"]], resize_keyboard=True)
+CATEGORIAS = ReplyKeyboardMarkup([
+    ["Comida", "Salud", "Camioneta"], ["Casa", "Trabajo", "Otros"], ["❌ Cancelar"]
+], resize_keyboard=True)
+
+
+def parsear_monto(texto):
+    """Pesos: punto para miles, coma para centavos; admite 1500.50 también."""
+    texto = str(texto).strip()
+    if re.fullmatch(r"[1-9][0-9]{0,2}(?:\.[0-9]{3})+(?:,[0-9]{1,2})?", texto):
+        texto = texto.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"[0-9]+(?:[,.][0-9]{1,2})?", texto):
+        texto = texto.replace(",", ".")
+    else:
+        raise ValueError("Importe inválido")
+    try:
+        monto = Decimal(texto)
+        if not monto.is_finite() or monto <= 0 or monto > Decimal("999999999999.99"):
+            raise ValueError("Importe fuera de rango")
+        return float(monto)
+    except InvalidOperation as exc:
+        raise ValueError("Importe inválido") from exc
+
+
+def autorizado(funcion):
+    @wraps(funcion)
+    async def ejecutar(update, context, *args, **kwargs):
+        if not update.effective_user or str(update.effective_user.id) not in bot_app.gente_permitida:
+            if update.effective_message:
+                await update.effective_message.reply_text("❌ Acceso denegado.")
+            return ConversationHandler.END
+        return await funcion(update, context, *args, **kwargs)
+    return ejecutar
+
+
+async def verificar_acceso(update, context):
+    if not update.effective_user or str(update.effective_user.id) not in bot_app.gente_permitida:
+        if update.effective_message:
+            await update.effective_message.reply_text("❌ Acceso denegado.")
+        raise ApplicationHandlerStop
+
+
 def normalizar_texto(texto):
     """
     Normaliza texto para comparar categorías sin problemas de mayúsculas,
@@ -45,63 +97,20 @@ def normalizar_texto(texto):
 
 
 def dividir_texto_en_bloques(texto, limite=MAX_TEXTO_MENSAJE_TELEGRAM):
-    """Divide un texto largo en bloques compatibles con Telegram."""
-    if not texto:
-        return []
-
-    if len(texto) <= limite:
-        return [texto]
-
-    bloques = []
-    bloque_actual = ""
-
-    for linea in texto.splitlines():
-        if not linea:
-            if bloque_actual:
-                bloques.append(bloque_actual)
-                bloque_actual = ""
-            continue
-
-        if not bloque_actual:
-            bloque_actual = linea
-            continue
-
-        if len(bloque_actual) + 1 + len(linea) <= limite:
-            bloque_actual = f"{bloque_actual}\n{linea}"
-        else:
-            bloques.append(bloque_actual)
-            bloque_actual = linea
-
-    if bloque_actual:
-        bloques.append(bloque_actual)
-
-    mensajes = []
-    for bloque in bloques:
-        if len(bloque) <= limite:
-            mensajes.append(bloque)
-            continue
-
-        partes = []
-        parte_actual = ""
-
-        for palabra in bloque.split(" "):
-            if not palabra:
-                continue
-
-            if not parte_actual:
-                parte_actual = palabra
-            elif len(parte_actual) + 1 + len(palabra) <= limite:
-                parte_actual = f"{parte_actual} {palabra}"
-            else:
-                partes.append(parte_actual)
-                parte_actual = palabra
-
-        if parte_actual:
-            partes.append(parte_actual)
-
-        mensajes.extend(partes)
-
-    return mensajes
+    """Conserva el contenido y limita unidades UTF-16, incluso sin espacios."""
+    if limite < 2:
+        raise ValueError("El límite debe ser al menos 2")
+    bloques, actual, unidades = [], [], 0
+    for caracter in texto:
+        cantidad = 2 if ord(caracter) > 0xFFFF else 1
+        if unidades + cantidad > limite:
+            bloques.append("".join(actual))
+            actual, unidades = [], 0
+        actual.append(caracter)
+        unidades += cantidad
+    if actual:
+        bloques.append("".join(actual))
+    return bloques
 
 
 class BotDeGastos:
@@ -109,7 +118,64 @@ class BotDeGastos:
         self.credenciales = None
         self.cliente_api = None
         self.planillita = None
-        self.gente_permitida = os.getenv('USUARIOS_AUTORIZADOS', '').split(',')
+        self.gente_permitida = {x.strip() for x in os.getenv('USUARIOS_AUTORIZADOS', '').split(',') if x.strip()}
+        self._hojas = {}
+        self._lock = threading.RLock()
+        self._derivadas_lock = threading.Lock()
+        self._cache = None
+        self._cache_hasta = 0
+        self._version = 0
+        self._version_actualizada = -1
+        self._inciertos = set()
+        self._guardados = set()
+        self._llamadas = 0
+        self._tamano_derivadas = {}
+
+    def _hoja(self, nombre):
+        if nombre not in self._hojas:
+            self._hojas[nombre] = self.planillita.worksheet(nombre)
+            self._llamadas += 1
+        return self._hojas[nombre]
+
+    def _leer_gastos(self, forzar=False):
+        with self._lock:
+            if forzar or self._cache is None or time.monotonic() >= self._cache_hasta:
+                self._cache = self._hoja('Gastos').get_all_records()
+                self._llamadas += 1
+                self._cache_hasta = time.monotonic() + 15
+            return self._cache
+
+    def _actualizar_derivada(self, nombre, datos):
+        # Una sola escritura sustituye el rango gestionado, sin clear() previo.
+        hoja = self._hoja(nombre)
+        if nombre not in self._tamano_derivadas:
+            self._tamano_derivadas[nombre] = len(hoja.get_all_values())
+            self._llamadas += 1
+        anterior = self._tamano_derivadas[nombre]
+        valores = datos + [[''] * len(datos[0]) for _ in range(max(0, anterior - len(datos)))]
+        hoja.update(range_name='A1', values=valores, value_input_option='RAW')
+        self._llamadas += 1
+        self._tamano_derivadas[nombre] = len(datos)
+
+    def _refrescar_derivadas_sync(self):
+        with self._derivadas_lock:
+            with self._lock:
+                datos = self._leer_gastos(forzar=True)
+                version = self._version
+            # Las escrituras derivadas no retienen el bloqueo del guardado.
+            self._refrescar_resumen(datos)
+            self._refrescar_proyeccion(datos)
+            self._version_actualizada = version
+
+    async def mantener_derivadas(self):
+        while True:
+            await asyncio.sleep(2)
+            if self._version_actualizada != self._version:
+                try:
+                    await asyncio.to_thread(self._refrescar_derivadas_sync)
+                except Exception:
+                    registro_errores.exception("No se actualizaron los agregados; se reintentará")
+                    await asyncio.sleep(10)
 
     def _conectar_google_sync(self):
         """Función bloqueante que conecta con Google Sheets."""
@@ -137,6 +203,18 @@ class BotDeGastos:
                 self.planillita = self.cliente_api.open('Gastos Hormiga')
 
             self._armar_hojas_si_no_existen()
+            hoja = self._hoja('Gastos')
+            encabezado = hoja.row_values(1)
+            esperado = ['Fecha', 'Usuario', 'Categoría', 'Descripción', 'Monto',
+                        'Cuotas', 'Cuota Actual', 'Monto Cuota', 'Mes Impacto']
+            if encabezado[:9] != esperado or (len(encabezado) > 9 and encabezado[9] != 'ID'):
+                raise ValueError("Columnas de Gastos incompatibles; no se modificaron registros")
+            if len(encabezado) == 9:
+                if hoja.col_count < 10:
+                    hoja.add_cols(10 - hoja.col_count)
+                elif any(hoja.col_values(10)):
+                    raise ValueError('La columna J contiene datos sin encabezado; no se modificó')
+                hoja.update(range_name='J1', values=[['ID']], value_input_option='RAW')
             return True
 
         except Exception as e:
@@ -186,58 +264,53 @@ class BotDeGastos:
                 'Total Proyectado'
             ])
 
-    def _anotar_gasto_sync(self, nombre_user, categoria_gasto, detalle, plata):
-        """
-        Guarda un gasto siempre en 1 cuota.
-        Se mantienen las columnas de cuotas para compatibilidad con la planilla existente.
-        """
+    def _anotar_gasto_sync(self, nombre_user, categoria_gasto, detalle, plata, gasto_id=None):
+        inicio = time.monotonic()
+        llamadas = self._llamadas
+        gasto_id = gasto_id or str(uuid4())
         try:
-            pestaña_gastos = self.planillita.worksheet('Gastos')
-
-            ahora = datetime.now(ZONA_HORARIA)
-            fecha_texto = ahora.strftime('%Y-%m-%d %H:%M:%S')
-            mes_impacto = ahora.strftime('%Y-%m')
-
-            fila = [
-                fecha_texto,
-                nombre_user,
-                categoria_gasto,
-                detalle,
-                plata,
-                1,
-                1,
-                plata,
-                mes_impacto,
-                ''
-            ]
-
-            pestaña_gastos.append_row(fila)
-
-            self._refrescar_resumen()
-            self._refrescar_proyeccion()
-
-            return True
-
-        except Exception as e:
-            registro_errores.error(f"Fallo al querer guardar el gasto: {e}")
+            if not categoria_gasto.strip() or not detalle.strip():
+                raise ValueError("Categoría y detalle obligatorios")
+            plata = parsear_monto(str(plata))
+            with self._lock:
+                if gasto_id in self._guardados:
+                    return True
+                hoja = self._hoja('Gastos')
+                if gasto_id in self._inciertos:
+                    # Un timeout puede ocurrir después de guardar: consultar antes de repetir.
+                    registros = self._leer_gastos(forzar=True)
+                    if any(str(g.get('ID', '')) == gasto_id for g in registros):
+                        self._guardados.add(gasto_id)
+                        self._inciertos.discard(gasto_id)
+                        self._version += 1
+                        return True
+                ahora = datetime.now(ZONA_HORARIA)
+                fila = [ahora.strftime('%Y-%m-%d %H:%M:%S'), nombre_user,
+                        categoria_gasto, detalle, plata, 1, 1, plata,
+                        ahora.strftime('%Y-%m'), gasto_id]
+                self._inciertos.add(gasto_id)
+                self._llamadas += 1
+                hoja.append_row(fila, value_input_option='RAW', table_range='A:J')
+                self._guardados.add(gasto_id)
+                self._inciertos.discard(gasto_id)
+                self._cache = None
+                self._version += 1
+                return True
+        except Exception:
+            registro_errores.exception("Fallo al guardar el gasto")
             return False
+        finally:
+            registro_errores.info("Guardado: %.3fs, %d llamadas Sheets",
+                                 time.monotonic() - inicio, self._llamadas - llamadas)
 
-    async def anotar_gasto_async(self, nombre_user, categoria_gasto, detalle, plata):
-        return await asyncio.to_thread(
-            self._anotar_gasto_sync,
-            nombre_user,
-            categoria_gasto,
-            detalle,
-            plata
-        )
+    async def anotar_gasto_async(self, nombre_user, categoria_gasto, detalle, plata, gasto_id=None):
+        return await asyncio.to_thread(self._anotar_gasto_sync, nombre_user,
+                                       categoria_gasto, detalle, plata, gasto_id)
 
-    def _refrescar_resumen(self):
+    def _refrescar_resumen(self, todos_los_gastos=None):
         """Recalcula el resumen mensual de la hoja Resumen Mensual."""
         try:
-            pestaña_gastos = self.planillita.worksheet('Gastos')
-            pestaña_resumen = self.planillita.worksheet('Resumen Mensual')
-
-            todos_los_gastos = pestaña_gastos.get_all_records()
+            todos_los_gastos = self._leer_gastos() if todos_los_gastos is None else todos_los_gastos
             datos_por_mes = {}
 
             for item in todos_los_gastos:
@@ -297,22 +370,19 @@ class BotDeGastos:
                     f"{len(info['categorias'])} categorías"
                 ])
 
-            pestaña_resumen.clear()
-            pestaña_resumen.update(range_name='A1', values=nuevos_datos)
+            self._actualizar_derivada('Resumen Mensual', nuevos_datos)
 
         except Exception as e:
             registro_errores.error(f"Fallo actualizando el resumen: {e}")
+            raise
 
-    def _refrescar_proyeccion(self):
+    def _refrescar_proyeccion(self, todos_los_gastos=None):
         """
         Mantengo la proyección para no romper el bot.
         Como ahora todos los gastos son en 1 cuota, las cuotas pendientes van a tender a 0.
         """
         try:
-            pestaña_gastos = self.planillita.worksheet('Gastos')
-            pestaña_futuro = self.planillita.worksheet('Proyección')
-
-            todos_los_gastos = pestaña_gastos.get_all_records()
+            todos_los_gastos = self._leer_gastos() if todos_los_gastos is None else todos_los_gastos
             futuro = {}
             ahora = datetime.now(ZONA_HORARIA)
 
@@ -373,11 +443,15 @@ class BotDeGastos:
                     round(estimado_final, 2)
                 ])
 
-            pestaña_futuro.clear()
-            pestaña_futuro.update(range_name='A1', values=nuevos_datos)
+            self._actualizar_derivada('Proyección', nuevos_datos)
 
         except Exception as e:
             registro_errores.error(f"Fallo calculando el futuro: {e}")
+            raise
+
+    @staticmethod
+    def _mes_valido(texto):
+        return bool(re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", texto)) and int(texto[:4]) > 0
 
     def _normalizar_mes_para_resumen(self, mes_solicitado, todos_los_gastos):
         """
@@ -409,12 +483,12 @@ class BotDeGastos:
             inicio = rango_coinc.group(1)
             fin = rango_coinc.group(2)
             # Validar que inicio <= fin
-            if inicio <= fin:
+            if self._mes_valido(inicio) and self._mes_valido(fin) and inicio <= fin:
                 return ('RANGE', inicio, fin)
             else:
                 return None
 
-        if re.match(r'^\d{4}-\d{2}$', texto):
+        if self._mes_valido(texto):
             return texto
 
         coincidencia = re.match(r'^(\d{1,2})/(\d{4})$', texto)
@@ -422,7 +496,7 @@ class BotDeGastos:
             mes = int(coincidencia.group(1))
             anio = int(coincidencia.group(2))
 
-            if 1 <= mes <= 12:
+            if 1 <= mes <= 12 and anio > 0:
                 return f"{anio}-{mes:02d}"
 
         # Soporte para frases del tipo "desde 2026-01 hasta 2026-03"
@@ -430,7 +504,7 @@ class BotDeGastos:
         if desde_hasta:
             inicio = desde_hasta.group(1)
             fin = desde_hasta.group(2)
-            if inicio <= fin:
+            if self._mes_valido(inicio) and self._mes_valido(fin) and inicio <= fin:
                 return ('RANGE', inicio, fin)
 
         return None
@@ -438,8 +512,7 @@ class BotDeGastos:
     def _sacar_resumen_filtrado_sync(self, mes_solicitado=None, categoria_solicitada=None):
         """Devuelve resumen por mes y, opcionalmente, por categoría."""
         try:
-            pestaña_gastos = self.planillita.worksheet('Gastos')
-            todos_los_gastos = pestaña_gastos.get_all_records()
+            todos_los_gastos = self._leer_gastos()
 
             mes = self._normalizar_mes_para_resumen(mes_solicitado, todos_los_gastos)
 
@@ -504,12 +577,13 @@ class BotDeGastos:
                 categorias[rubro] += plata
 
                 detalles.append({
-                    'fecha': str(g.get('Fecha', ''))[:10],
+                    'fecha': str(g.get('Fecha', '')),
                     'categoria': rubro,
                     'descripcion': str(g.get('Descripción', '')).strip(),
                     'monto': plata
                 })
 
+            detalles.reverse()
             detalles.sort(key=lambda x: x['fecha'], reverse=True)
 
             categorias_disponibles = sorted({
@@ -554,7 +628,8 @@ class BotDeGastos:
 
     def _sacar_futuro_sync(self):
         try:
-            return self.planillita.worksheet('Proyección').get_all_records()
+            self._refrescar_derivadas_sync()
+            return self._hoja('Proyección').get_all_records()
         except Exception as e:
             registro_errores.error(f"Error leyendo la proyección: {e}")
             return None
@@ -569,57 +644,38 @@ bot_app = BotDeGastos()
 
 # === FUNCIONES DE TELEGRAM ===
 
+@autorizado
 async def arrancar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usuario = update.effective_user
-    nombre_pantalla = usuario.username or usuario.first_name
-
-    if str(usuario.id) not in bot_app.gente_permitida and len(bot_app.gente_permitida) > 0:
-        await update.message.reply_text(f"❌ Acceso denegado. Tu ID es: {usuario.id}")
-        return ConversationHandler.END
-
-    botonera = [
-        [KeyboardButton("💰 Nuevo Gasto"), KeyboardButton("📊 Resumen")],
-        [KeyboardButton("📈 Proyección"), KeyboardButton("❓ Ayuda")]
-    ]
-
-    teclado_visual = ReplyKeyboardMarkup(botonera, resize_keyboard=True)
-
+    if context.user_data.get('guardado_incierto'):
+        await update.message.reply_text("Conservé un gasto pendiente. Tocá 🔄 Reintentar para verificarlo.",
+                                        reply_markup=ReplyKeyboardMarkup([["🔄 Reintentar", "❌ Cancelar"]], resize_keyboard=True))
+        return PASO_DETALLE
     await update.message.reply_text(
-        f"¡Qué onda {nombre_pantalla}! 👋\n\n"
-        "Manejo tus gastos al toque.\n\n"
-        "Carga rápida:\n"
-        "💵 <monto> <descripción>\n\n"
-        "Ejemplo:\n"
-        "5000 Nafta camioneta\n\n"
-        "Para cargar con categoría, tocá:\n"
-        "💰 Nuevo Gasto",
-        reply_markup=teclado_visual
-    )
+        f"Hola {update.effective_user.first_name} 👋\n"
+        "Anotá un gasto con categoría, monto y detalle.\n\n"
+        "Carga rápida: Comida | 8.500,50 | Almuerzo\n"
+        "También podés tocar 💰 Nuevo Gasto.\n"
+        "El formato anterior, 5000 Nafta, sigue disponible como Sin clasificar.",
+        reply_markup=MENU)
+    return ConversationHandler.END
 
 
+@autorizado
 async def tirar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Ayuda*\n\n"
-        "*Carga rápida:*\n"
-        "`<monto> <descripción>`\n\n"
-        "Ejemplo:\n"
-        "`35000 Remera`\n\n"
-        "*Carga con categoría:*\n"
-        "Tocá `💰 Nuevo Gasto` y seguí los pasos.\n\n"
-        "*Resumen filtrado:*\n"
-        "Tocá `📊 Resumen` o usá:\n"
-        "`/resumen 2026-05 camioneta`\n\n"
-        "También podés usar:\n"
-        "`/resumen este camioneta`\n"
-        "`/resumen anterior comida`\n\n"
-        "Ahora también podés usar:\n"
-        "`/resumen todos camioneta`  (todos los registros de la categoría)\n"
-        "`/resumen 2026-01:2026-03 camioneta`  (rango de meses)\n"
-        "Si querés ver todos los movimientos cuando hay más de 15, podés añadir `--all` al final:\n"
-        "`/resumen 2026-05 camioneta --all`\n\n"
-        "Nota: todos los gastos se guardan automáticamente en 1 cuota.",
-        parse_mode='Markdown'
-    )
+        "📖 Ayuda\n\n"
+        "Carga rápida: categoría | monto | detalle\n"
+        "Ejemplo: Camioneta | 35.000 | Nafta\n"
+        "Formato anterior: 35000 Nafta (Sin clasificar).\n\n"
+        "Carga guiada: 💰 Nuevo Gasto. Solo categoría, monto y detalle.\n"
+        "Montos: 1500, 1.500, 1.500,50 o 1500.50.\n"
+        "Usá ⬅️ Volver para corregir o /cancelar para salir.\n"
+        "Si falla el guardado, tocá 🔄 Reintentar.\n\n"
+        "Resumen: /resumen este camioneta\n"
+        "/resumen anterior comida\n"
+        "/resumen todos camioneta\n"
+        "/resumen 2026-01:2026-03 camioneta --all\n"
+        "Proyección: /proyeccion")
 
 
 def armar_mensaje_resumen(info, mostrar_todos=False):
@@ -657,16 +713,16 @@ def armar_mensaje_resumen(info, mostrar_todos=False):
 
     aviso_limite = ""
     if len(detalles) > 15 and not mostrar_todos:
-        aviso_limite = f"\n\n_Últimos 15 de {len(detalles)} movimientos._\nEscribí `/resumen {info.get('mes','') } {info.get('categoria','')} --all` para verlos todos."
+        aviso_limite = f"\n\nÚltimos 15 de {len(detalles)} movimientos.\nEscribí /resumen {info.get('mes','') } {info.get('categoria','')} --all para verlos todos."
 
     return (
-        f"📊 *Resumen de {info['mes']}*\n"
-        f"🏷 Categoría: *{info['categoria']}*\n\n"
-        f"💰 Total: *${info['total']:.2f}*\n"
-        f"📝 Movimientos: *{info['cantidad']}*\n\n"
-        f"*Por categoría:*\n"
+        f"📊 Resumen de {info['mes']}\n"
+        f"🏷 Categoría: {info['categoria']}\n\n"
+        f"💰 Total: ${info['total']:.2f}\n"
+        f"📝 Movimientos: {info['cantidad']}\n\n"
+        f"Por categoría:\n"
         f"{texto_categorias}\n\n"
-        f"*Últimos movimientos:*\n"
+        f"Últimos movimientos:\n"
         f"{texto_detalles}"
         f"{aviso_limite}"
     )
@@ -694,6 +750,7 @@ def _parse_categoria_y_flag(texto_categoria_raw):
     return texto, mostrar_todos
 
 
+@autorizado
 async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT_TYPE, mes, categoria, mostrar_todos=False):
     await update.message.reply_text("📊 Calculando resumen...")
 
@@ -703,7 +760,7 @@ async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT
     )
 
     mensaje = armar_mensaje_resumen(info, mostrar_todos=mostrar_todos)
-    bloques = dividir_texto_en_bloques(mensaje)
+    bloques = dividir_texto_en_bloques(mensaje, limite=4000)
 
     for indice, bloque in enumerate(bloques):
         texto_a_enviar = bloque
@@ -711,9 +768,10 @@ async def mostrar_resumen_filtrado(update: Update, context: ContextTypes.DEFAULT
         if indice > 0:
             texto_a_enviar = f"🔄 Continuación {indice + 1}/{len(bloques)}\n\n{bloque}"
 
-        await update.message.reply_text(texto_a_enviar, parse_mode='Markdown')
+        await update.message.reply_text(texto_a_enviar, reply_markup=MENU)
 
 
+@autorizado
 async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Permite:
@@ -724,6 +782,9 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
     /resumen 2026-01:2026-03 camioneta
     /resumen 2026-05 camioneta --all
     """
+    if context.user_data.get('guardado_incierto'):
+        await update.message.reply_text("Hay un guardado pendiente. Reintentá o /cancelar antes de cambiar de operación.")
+        return PASO_DETALLE
     args = getattr(context, "args", None) or []
 
     if args:
@@ -750,14 +811,19 @@ async def arrancar_resumen_guiado(update: Update, context: ContextTypes.DEFAULT_
         "• `todos` (todas las fechas)\n"
         "• `2026-01:2026-03` (rango)\n\n"
         "Escribí una opción:",
-        parse_mode='Markdown'
+        reply_markup=CONTROLES, parse_mode=None
     )
 
     return PASO_RESUMEN_MES
 
 
+@autorizado
 async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['resumen_mes'] = update.message.text.strip()
+    mes = update.message.text.strip()
+    if bot_app._normalizar_mes_para_resumen(mes, []) is None:
+        await update.message.reply_text('❌ Mes inválido. Usá este, anterior, todos o YYYY-MM.')
+        return PASO_RESUMEN_MES
+    context.user_data['resumen_mes'] = mes
 
     await update.message.reply_text(
         "🏷 ¿De qué categoría?\n\n"
@@ -769,12 +835,13 @@ async def agarrar_mes_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Si querés ver todos los movimientos, escribí, por ejemplo:\n"
         "`camioneta mostrar todo`\n\n"
         "Escribí la categoría:",
-        parse_mode='Markdown'
+        reply_markup=CONTROLES, parse_mode=None
     )
 
     return PASO_RESUMEN_CATEGORIA
 
 
+@autorizado
 async def agarrar_categoria_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mes = context.user_data.get('resumen_mes', 'este')
     categoria_raw = update.message.text.strip()
@@ -787,16 +854,17 @@ async def agarrar_categoria_resumen(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
+@autorizado
 async def mostrar_futuro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📈 Leyendo proyección...")
 
     filas = await bot_app.sacar_futuro_async()
 
     if filas:
-        mensaje = "📈 *Lo que se te viene*\n\n"
+        mensaje = "📈 Proyección estimada\n\n"
 
         for i, fila in enumerate(filas[:6]):
-            mes_texto = f"*{fila['Mes']}* (Este mes)\n" if i == 0 else f"*{fila['Mes']}*\n"
+            mes_texto = f"{fila['Mes']} (Este mes)\n" if i == 0 else f"{fila['Mes']}\n"
             mensaje += mes_texto
             mensaje += (
                 f"  💳 Tarjeta: ${float(fila.get('Monto Cuotas', 0) or 0):.2f}\n"
@@ -804,7 +872,7 @@ async def mostrar_futuro(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  📊 Vas a necesitar: ${float(fila.get('Total Proyectado', 0) or 0):.2f}\n\n"
             )
 
-        await update.message.reply_text(mensaje, parse_mode='Markdown')
+        await update.message.reply_text(mensaje, parse_mode=None)
 
     else:
         await update.message.reply_text("❌ No pude leer la pestaña de Proyección.")
@@ -812,141 +880,183 @@ async def mostrar_futuro(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === MÁQUINA DE ESTADOS PARA CARGA GUIADA ===
 
+@autorizado
 async def arrancar_gasto_guiado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💰 ¿En qué categoría entra este gasto?\n\n"
-        "Ejemplos: Comida, Salud, Camioneta, Casa, Trabajo."
-    )
+    if context.user_data.get('guardado_incierto'):
+        await update.message.reply_text("Hay un guardado pendiente. Reintentá o cancelá antes de iniciar otro.")
+        return PASO_DETALLE
+    for clave in ('categoria_elegida', 'plata_gastada', 'detalle_compra', 'gasto_id', 'guardado_incierto'):
+        context.user_data.pop(clave, None)
+    context.user_data['gasto_id'] = str(uuid4())
+    await update.message.reply_text("🏷 Elegí o escribí la categoría:", reply_markup=CATEGORIAS)
     return PASO_CATEGORIA
 
 
+@autorizado
 async def agarrar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['categoria_elegida'] = update.message.text.strip().title()
-
-    await update.message.reply_text("💵 ¿Cuánta plata gastaste? Solo números:")
+    categoria = update.message.text.strip()
+    if not categoria or len(categoria) > 100:
+        await update.message.reply_text("❌ Escribí una categoría de 1 a 100 caracteres.")
+        return PASO_CATEGORIA
+    context.user_data['categoria_elegida'] = categoria.title()
+    await update.message.reply_text("💵 ¿Cuánto gastaste? Ejemplo: 1.500,50", reply_markup=CONTROLES)
     return PASO_PLATA
 
 
+@autorizado
 async def agarrar_plata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        plata = float(update.message.text.strip().replace(',', '.'))
-        context.user_data['plata_gastada'] = plata
-
-        await update.message.reply_text("📝 ¿Qué compraste o qué gasto fue?")
-        return PASO_DETALLE
-
+        context.user_data['plata_gastada'] = parsear_monto(update.message.text)
     except ValueError:
-        await update.message.reply_text("❌ Pasame un número válido. Sin letras.")
+        await update.message.reply_text("❌ Ingresá un monto mayor que cero. Ejemplos: 1500 o 1.500,50.")
         return PASO_PLATA
+    await update.message.reply_text("📝 Escribí el detalle:", reply_markup=CONTROLES)
+    return PASO_DETALLE
 
 
+@autorizado
 async def agarrar_detalle_y_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['detalle_compra'] = update.message.text.strip()
+    if update.message.text != '🔄 Reintentar':
+        detalle = update.message.text.strip()
+        if not detalle or len(detalle) > 2000:
+            await update.message.reply_text("❌ Escribí un detalle de 1 a 2000 caracteres.")
+            return PASO_DETALLE
+        context.user_data['detalle_compra'] = detalle
+    return await guardar_borrador(update, context)
 
-    usuario = update.effective_user
-    nombre_pantalla = usuario.username or usuario.first_name
 
-    required_keys = (
-        "categoria_elegida",
-        "detalle_compra",
-        "plata_gastada"
-    )
-
-    if not all(k in context.user_data for k in required_keys):
-        await update.message.reply_text("❌ Me faltan datos del gasto. Volvé a cargarlo desde el inicio.")
-        context.user_data.clear()
+@autorizado
+async def guardar_borrador(update, context):
+    datos = context.user_data
+    if not all(k in datos for k in ('categoria_elegida', 'plata_gastada', 'detalle_compra')):
+        await update.message.reply_text("Faltan datos. Tocá 💰 Nuevo Gasto para completar la carga.", reply_markup=MENU)
         return ConversationHandler.END
-
-    todo_ok = await bot_app.anotar_gasto_async(
-        nombre_user=nombre_pantalla,
-        categoria_gasto=context.user_data["categoria_elegida"],
-        detalle=context.user_data["detalle_compra"],
-        plata=context.user_data["plata_gastada"]
-    )
-
-    if todo_ok:
-        plata = context.user_data["plata_gastada"]
-        categoria = context.user_data["categoria_elegida"]
-        detalle = context.user_data["detalle_compra"]
-
-        mensaje = (
-            f"🐜 *Anotado: ${plata:.2f}*\n"
-            f"{categoria} | {detalle}\n"
-            f"1 cuota"
-        )
-    else:
-        mensaje = "❌ Error guardando en Google Sheets."
-
-    await update.message.reply_text(mensaje, parse_mode="Markdown")
-
-    context.user_data.clear()
+    datos.setdefault('gasto_id', str(uuid4()))
+    if datos.get('guardado_incierto'):
+        bot_app._inciertos.add(datos['gasto_id'])
+    datos['guardado_incierto'] = True
+    # Persistir antes de escribir: un reinicio conserva el borrador y obliga a verificar el ID.
+    if context.application.persistence:
+        context.application.mark_data_for_update_persistence(user_ids=[update.effective_user.id])
+        await context.application.update_persistence()
+        await context.application.persistence.flush()
+    usuario = update.effective_user
+    ok = await bot_app.anotar_gasto_async(
+        usuario.username or usuario.first_name, datos['categoria_elegida'],
+        datos['detalle_compra'], datos['plata_gastada'], datos['gasto_id'])
+    if not ok:
+        await update.message.reply_text(
+            "❌ Google Sheets no confirmó el guardado. Conservé los datos.\n"
+            "Tocá 🔄 Reintentar para verificarlo antes de volver a guardar.",
+            reply_markup=ReplyKeyboardMarkup([["🔄 Reintentar", "❌ Cancelar"]], resize_keyboard=True))
+        return PASO_DETALLE
+    mensaje = f"✅ Anotado: ${datos['plata_gastada']:.2f}\n{datos['categoria_elegida']} | {datos['detalle_compra']}"
+    # Limpiar antes de responder: una falla de Telegram no debe permitir otra escritura.
+    for clave in ('categoria_elegida', 'plata_gastada', 'detalle_compra', 'gasto_id', 'guardado_incierto'):
+        datos.pop(clave, None)
+    for bloque in dividir_texto_en_bloques(mensaje, limite=4000):
+        await update.message.reply_text(bloque, reply_markup=MENU)
     return ConversationHandler.END
 
 
+@autorizado
 async def tirar_todo_al_tacho(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    incierto = context.user_data.get('guardado_incierto', False)
     context.user_data.clear()
-    await update.message.reply_text("❌ Operación cancelada.")
+    mensaje = "Operación cancelada."
+    if incierto:
+        mensaje += " El último guardado no fue confirmado; revisá el resumen antes de cargarlo otra vez."
+    await update.message.reply_text(mensaje, reply_markup=MENU)
     return ConversationHandler.END
 
 
-# === LECTURA DE TEXTO LIBRE ===
+@autorizado
+async def volver(update, context):
+    datos = context.user_data
+    if datos.get('guardado_incierto'):
+        await update.message.reply_text("Reintentá el guardado pendiente antes de modificarlo.")
+        return PASO_DETALLE
+    if 'detalle_compra' in datos or 'plata_gastada' in datos:
+        datos.pop('detalle_compra', None)
+        datos.pop('plata_gastada', None)
+        await update.message.reply_text("💵 Corregí el monto:", reply_markup=CONTROLES)
+        return PASO_PLATA
+    if 'categoria_elegida' in datos:
+        datos.pop('categoria_elegida', None)
+        await update.message.reply_text("🏷 Corregí la categoría:", reply_markup=CATEGORIAS)
+        return PASO_CATEGORIA
+    if 'resumen_mes' in datos:
+        datos.pop('resumen_mes', None)
+        return await arrancar_resumen_guiado(update, context)
+    return await tirar_todo_al_tacho(update, context)
 
+
+def navegar(funcion):
+    @wraps(funcion)
+    @autorizado
+    async def ejecutar(update, context):
+        texto = update.message.text
+        if texto == '❌ Cancelar':
+            return await tirar_todo_al_tacho(update, context)
+        if texto == '⬅️ Volver':
+            return await volver(update, context)
+        if texto == '🔄 Reintentar':
+            return await guardar_borrador(update, context)
+        if texto == '💰 Nuevo Gasto':
+            return await arrancar_gasto_guiado(update, context)
+        if texto in ('📊 Resumen', '📈 Proyección', '❓ Ayuda'):
+            # Mostrar información sin abandonar la carga en curso.
+            if texto == '❓ Ayuda':
+                await tirar_ayuda(update, context)
+            elif texto == '📈 Proyección':
+                await mostrar_futuro(update, context)
+            else:
+                await mostrar_resumen_filtrado(update, context, 'este', 'todas')
+            await update.message.reply_text("Podés continuar la operación anterior o /cancelar.", reply_markup=CONTROLES)
+            return None
+        if context.user_data.get('guardado_incierto'):
+            await update.message.reply_text("Tocá 🔄 Reintentar o /cancelar; conservé los datos originales.")
+            return PASO_DETALLE
+        return await funcion(update, context)
+    return ejecutar
+
+
+@autorizado
 async def leer_mensaje_al_toque(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip()
-
-    if texto == "💰 Nuevo Gasto":
+    if texto == '💰 Nuevo Gasto':
         return await arrancar_gasto_guiado(update, context)
-
-    if texto == "📊 Resumen":
+    if texto == '📊 Resumen':
         return await arrancar_resumen_guiado(update, context)
-
-    if texto == "📈 Proyección":
+    if texto == '📈 Proyección':
         return await mostrar_futuro(update, context)
-
-    if texto == "❓ Ayuda":
+    if texto == '❓ Ayuda':
         return await tirar_ayuda(update, context)
-
-    patron_gasto_rapido = r'^\s*(\d+(?:[.,]\d+)?)\s+(.+?)\s*$'
-    coincidencia = re.match(patron_gasto_rapido, texto)
-
-    if coincidencia:
-        try:
-            plata = float(coincidencia.group(1).replace(',', '.'))
-            descripcion = coincidencia.group(2).strip()
-
-            usuario = update.effective_user
-            nombre_pantalla = usuario.username or usuario.first_name
-
-            todo_ok = await bot_app.anotar_gasto_async(
-                nombre_user=nombre_pantalla,
-                categoria_gasto='Sin clasificar',
-                detalle=descripcion,
-                plata=plata
-            )
-
-            if todo_ok:
-                await update.message.reply_text(
-                    f"✅ *Anotado al toque*\n"
-                    f"💵 ${plata:.2f} en {descripcion}\n"
-                    f"🏷 Categoría: Sin clasificar\n"
-                    f"1 cuota",
-                    parse_mode='Markdown'
-                )
-            else:
-                await update.message.reply_text("❌ Error al guardar.")
-
-        except Exception as e:
-            registro_errores.error(f"Error procesando mensaje rápido: {e}")
-            await update.message.reply_text("❌ Usá: <plata> <qué es>")
-
-    else:
-        await update.message.reply_text(
-            "No entendí el mensaje.\n\n"
-            "Para carga rápida usá:\n"
-            "`5000 Nafta camioneta`\n\n"
-            "O tocá `💰 Nuevo Gasto`.",
-            parse_mode='Markdown'
-        )
+    if texto == '🔄 Reintentar':
+        return await guardar_borrador(update, context)
+    if texto == '❌ Cancelar':
+        return await tirar_todo_al_tacho(update, context)
+    if context.user_data.get('guardado_incierto'):
+        await update.message.reply_text("Hay un guardado pendiente. Tocá 🔄 Reintentar o /cancelar.")
+        return PASO_DETALLE
+    try:
+        if '|' in texto:
+            partes = texto.split('|', 2)
+            if len(partes) != 3:
+                raise ValueError("Faltan campos")
+            categoria, monto, detalle = [parte.strip() for parte in partes]
+        else:
+            monto, detalle = texto.split(maxsplit=1)
+            categoria = 'Sin clasificar'
+        if not categoria or len(categoria) > 100 or not detalle or len(detalle) > 2000:
+            raise ValueError("Categoría o detalle inválidos")
+        plata = parsear_monto(monto)
+    except ValueError:
+        await update.message.reply_text("Usá: Comida | 8.500,50 | Almuerzo\nO tocá 💰 Nuevo Gasto.", reply_markup=MENU)
+        return ConversationHandler.END
+    context.user_data.update(categoria_elegida=categoria, plata_gastada=plata,
+                             detalle_compra=detalle, gasto_id=f"tg-{update.effective_chat.id}-{update.message.message_id}")
+    return await guardar_borrador(update, context)
 
 
 async def principal_async():
@@ -956,50 +1066,76 @@ async def principal_async():
         registro_errores.error("No conectó a Sheets. Revisá el JSON o las variables de entorno.")
         return
 
-    app = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+    estado = os.getenv('BOT_STATE_PATH', str(os.path.join(os.path.dirname(__file__), '.estado-bot.pickle')))
+    persistence = PicklePersistence(filepath=estado, update_interval=1)
+    app = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).concurrent_updates(False).persistence(persistence).build()
 
     charla_guiada = ConversationHandler(
+        name="gastos", persistent=True,
         entry_points=[
             MessageHandler(filters.Regex('^💰 Nuevo Gasto$'), arrancar_gasto_guiado),
             MessageHandler(filters.Regex('^📊 Resumen$'), arrancar_resumen_guiado),
             CommandHandler("resumen", arrancar_resumen_guiado),
+            CommandHandler("start", arrancar),
+            CommandHandler("cancelar", tirar_todo_al_tacho),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, leer_mensaje_al_toque),
         ],
         states={
             PASO_CATEGORIA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_categoria)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, navegar(agarrar_categoria))
             ],
             PASO_PLATA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_plata)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, navegar(agarrar_plata))
             ],
             PASO_DETALLE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_detalle_y_guardar)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, navegar(agarrar_detalle_y_guardar))
             ],
             PASO_RESUMEN_MES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_mes_resumen)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, navegar(agarrar_mes_resumen))
             ],
             PASO_RESUMEN_CATEGORIA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, agarrar_categoria_resumen)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, navegar(agarrar_categoria_resumen))
             ],
         },
         fallbacks=[
-            CommandHandler('cancelar', tirar_todo_al_tacho)
+            CommandHandler('cancelar', tirar_todo_al_tacho),
+            CommandHandler('start', arrancar),
+            CommandHandler('ayuda', tirar_ayuda),
+            CommandHandler('proyeccion', mostrar_futuro),
+            CommandHandler('resumen', arrancar_resumen_guiado),
         ],
     )
 
-    app.add_handler(CommandHandler("start", arrancar))
+    app.add_handler(MessageHandler(filters.ALL, verificar_acceso), group=-1)
+    app.add_handler(charla_guiada)
     app.add_handler(CommandHandler("ayuda", tirar_ayuda))
     app.add_handler(CommandHandler("proyeccion", mostrar_futuro))
-    app.add_handler(charla_guiada)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, leer_mensaje_al_toque))
 
     registro_errores.info("Bot levantado. Escuchando...")
 
+    trabajador = None
     await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    stop_event = asyncio.Event()
-    await stop_event.wait()
+    try:
+        await app.start()
+        trabajador = asyncio.create_task(bot_app.mantener_derivadas())
+        await app.updater.start_polling(allowed_updates=["message"])
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for senal in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(senal, stop_event.set)
+        await stop_event.wait()
+    finally:
+        if app.updater.running:
+            await app.updater.stop()
+        if app.running:
+            await app.stop()
+        if trabajador:
+            trabajador.cancel()
+            try:
+                await trabajador
+            except asyncio.CancelledError:
+                pass
+        await app.shutdown()
 
 
 if __name__ == '__main__':

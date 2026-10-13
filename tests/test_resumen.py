@@ -11,7 +11,7 @@ def test_dividir_texto_en_bloques_respeta_limite():
 
     assert bloques
     assert all(len(bloque) <= 100 for bloque in bloques)
-    assert "\n".join(bloques) == texto
+    assert "".join(bloques) == texto
 
 
 def test_normalizar_mes_no_reconoce_actual_ni_ultimo():
