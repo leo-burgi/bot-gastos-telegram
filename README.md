@@ -28,25 +28,37 @@ El bot tiene dos formas principales de registrar gastos.
 
 ---
 
-## 1. Registro Rápido
+## 1. Registro rápido
 
-Sirve para anotar un gasto al instante.
-
-Formato:
+Ingresá categoría, monto y detalle en un mensaje:
 
 ```txt
-<monto> <descripción>
+Comida | 8.500,50 | Almuerzo
+Camioneta | 35000 | Nafta
+Casa | 1500.50 | Artículos de limpieza
 ```
-500 Almuerzo
-3000 Zapatillas 
-12000 Notebook 
-```
-Formato: <monto> <descripción> 
-```
-**2. Registro Guiado:**
-- Usa el botón "💰 Nuevo Gasto"
-- Sigue las instrucciones paso a paso
-- Incluye categoría personalizada
+
+Se acepta punto para miles y coma para centavos (`1.500,50`), o punto decimal
+sin separador de miles (`1500.50`). `1.500` representa mil quinientos pesos.
+El monto debe ser positivo, finito y tener hasta dos decimales.
+
+El formato anterior `<monto> <descripción>` sigue funcionando y guarda la
+categoría `Sin clasificar`.
+
+## 2. Registro guiado
+
+Tocá **💰 Nuevo Gasto**. Solo se solicita **categoría → monto → detalle**.
+Podés elegir una categoría sugerida o escribir una propia. Fecha y usuario
+se completan automáticamente; los gastos nuevos conservan una cuota en la
+planilla para mantener la compatibilidad.
+
+- **⬅️ Volver** permite corregir el paso anterior.
+- **❌ Cancelar** o `/cancelar` cancela la operación.
+- Si Google no confirma el guardado, se conserva el borrador y aparece
+  **🔄 Reintentar**. El mismo ID permite comprobar si la fila ya existe antes
+  de repetir la escritura. No vuelvas a ingresar el gasto en otro mensaje
+  mientras esté pendiente.
+- Los botones de ayuda, resumen y proyección no se guardan como datos del gasto.
 
 ### Comandos Disponibles
 
@@ -58,7 +70,7 @@ Formato: <monto> <descripción>
 ### Botones del Menú
 
 - 💰 **Nuevo Gasto** - Registro paso a paso con categorías
-- 📊 **Resumen Mes** - Total gastado este mes
+- 📊 **Resumen** - Total gastado este mes
 - 📈 **Proyección** - Gastos proyectados próximos meses
 - ❓ **Ayuda** - Guía rápida
 
@@ -69,8 +81,8 @@ Formato: <monto> <descripción>
 El bot crea automáticamente 3 hojas:
 
 ### 1. Gastos (Registro completo)
-| Fecha | Usuario | Categoría | Descripción | Monto | Cuotas | Cuota Actual | Monto Cuota | Mes Impacto |
-|-------|---------|-----------|-------------|-------|--------|--------------|-------------|-------------|
+| Fecha | Usuario | Categoría | Descripción | Monto | Cuotas | Cuota Actual | Monto Cuota | Mes Impacto | ID |
+|-------|---------|-----------|-------------|-------|--------|--------------|-------------|-------------|----|
 
 ### 2. Resumen Mensual
 | Mes | Total Gastos | Contado | Cuotas | Categorías Top |
@@ -154,3 +166,43 @@ Uso libre para fines personales.
 **¡Listo para usar!** 🎉
 
 Envía un mensaje al bot para empezar a registrar tus gastos.
+
+## Compatibilidad, rendimiento y recuperación
+
+Los registros históricos de **Gastos** no se borran ni se migran. Se conservan
+las diez columnas existentes y el cálculo por **Monto Cuota**, incluidas las
+cuotas antiguas. Si falta el encabezado ID en una planilla de nueve columnas,
+se agrega únicamente ese encabezado y, si hace falta, una columna vacía. Si la
+estructura no coincide o esa columna contiene datos sin encabezado, el bot
+se detiene para evitar escribir en columnas equivocadas.
+
+El guardado normal agrega una fila y confirma sin recalcular las otras hojas.
+Una tarea supervisada agrupa los cambios cada dos segundos y actualiza
+**Resumen Mensual** y **Proyección** con una sola lectura del historial,
+sin borrar las hojas antes de escribir. Los errores se reintentan; un error
+en los agregados no convierte un gasto guardado en un fallo de guardado.
+La proyección solicitada se recalcula al consultar. Las consultas de gastos
+usan una caché de 15 segundos, invalidada tras cada guardado del bot; una
+edición manual de la planilla puede tardar ese intervalo en verse.
+
+Los logs registran duración del guardado y cantidad de operaciones Sheets
+(sin incluir los datos del gasto). Los resúmenes ordenan por fecha y hora y
+los mensajes largos respetan el límite de Telegram, incluso con emojis.
+Todas las entradas requieren un ID incluido en `USUARIOS_AUTORIZADOS`.
+Una lista vacía deniega el acceso.
+
+El estado de conversación y los borradores se guardan en `.estado-bot.pickle`.
+Para conservarlos entre despliegues, configurá `BOT_STATE_PATH` en un volumen
+persistente y ejecutá **una sola instancia** del bot. El archivo contiene datos
+personales: mantenelo privado, fuera del repositorio y de carpetas públicas.
+La pérdida de ese archivo no elimina los gastos de Google Sheets, pero sí
+puede perder borradores locales. No uses un archivo de estado de origen ajeno.
+
+## Verificación local
+
+```bash
+python -m pytest -q
+```
+
+Las pruebas usan planillas simuladas: no escriben en Google Sheets ni envían
+mensajes de Telegram.
