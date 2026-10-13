@@ -33,16 +33,20 @@ El bot tiene dos formas principales de registrar gastos.
 Ingresá categoría, monto y detalle en un mensaje:
 
 ```txt
-Comida | 8.500,50 | Almuerzo
-Camioneta | 35000 | Nafta
-Casa | 1500.50 | Artículos de limpieza
+comida 1400 desayuno
+camioneta 35000 nafta
+casa 1500.50 artículos de limpieza
 ```
 
 Se acepta punto para miles y coma para centavos (`1.500,50`), o punto decimal
 sin separador de miles (`1500.50`). `1.500` representa mil quinientos pesos.
 El monto debe ser positivo, finito y tener hasta dos decimales.
 
-El formato anterior `<monto> <descripción>` sigue funcionando y guarda la
+Las categorías pueden contener espacios: `comida y bebida 1400 desayuno`.
+El primer número indica el monto y todo lo que sigue es el detalle.
+
+El formato anterior con barras verticales también sigue disponible.
+El formato `<monto> <descripción>` sigue funcionando y guarda la
 categoría `Sin clasificar`.
 
 ## 2. Registro guiado
