@@ -3,6 +3,7 @@ import logging
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import gspread
@@ -67,6 +68,19 @@ def parsear_monto(texto):
         raise ValueError("Importe inválido") from exc
 
 
+def cargar_usuarios_autorizados():
+    """Combina los usuarios del despliegue con los adicionales del proyecto."""
+    usuarios = {x.strip() for x in os.getenv('USUARIOS_AUTORIZADOS', '').split(',') if x.strip()}
+    archivo = Path(__file__).with_name('usuarios_autorizados.json')
+    adicionales = json.loads(archivo.read_text(encoding='utf-8'))
+    if not isinstance(adicionales, list) or any(
+        not isinstance(usuario, str) or not re.fullmatch(r'[1-9][0-9]*', usuario)
+        for usuario in adicionales
+    ):
+        raise ValueError('usuarios_autorizados.json debe contener una lista de IDs numéricos como texto')
+    return usuarios | set(adicionales)
+
+
 def autorizado(funcion):
     @wraps(funcion)
     async def ejecutar(update, context, *args, **kwargs):
@@ -118,7 +132,7 @@ class BotDeGastos:
         self.credenciales = None
         self.cliente_api = None
         self.planillita = None
-        self.gente_permitida = {x.strip() for x in os.getenv('USUARIOS_AUTORIZADOS', '').split(',') if x.strip()}
+        self.gente_permitida = cargar_usuarios_autorizados()
         self._hojas = {}
         self._lock = threading.RLock()
         self._derivadas_lock = threading.Lock()
