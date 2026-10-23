@@ -192,8 +192,12 @@ edición manual de la planilla puede tardar ese intervalo en verse.
 Los logs registran duración del guardado y cantidad de operaciones Sheets
 (sin incluir los datos del gasto). Los resúmenes ordenan por fecha y hora y
 los mensajes largos respetan el límite de Telegram, incluso con emojis.
-Todas las entradas requieren un ID incluido en `USUARIOS_AUTORIZADOS`.
-Una lista vacía deniega el acceso.
+Todas las entradas requieren un ID autorizado. Se combinan los IDs de
+`USUARIOS_AUTORIZADOS` con la lista adicional de `usuarios_autorizados.json`,
+sin reemplazar los usuarios configurados en el despliegue. El segundo usuario
+está registrado en ese archivo. Para revocar un acceso, quitá su ID de ambas
+fuentes si aparece en las dos; reiniciá el bot después de cambiar la configuración.
+Si ambas listas están vacías, se deniega el acceso.
 
 El estado de conversación y los borradores se guardan en `.estado-bot.pickle`.
 Para conservarlos entre despliegues, configurá `BOT_STATE_PATH` en un volumen

@@ -316,3 +316,27 @@ def test_carga_espacios_invalida_no_guarda(almacen, monkeypatch, texto):
     assert asyncio.run(bot.leer_mensaje_al_toque(update, context)) == bot.ConversationHandler.END
     assert not almacen._hojas['Gastos'].registros
     assert 'comida 1400 desayuno' in update.message.reply_text.call_args.args[0]
+
+
+def test_segundo_usuario_se_agrega_sin_reemplazar_configurados(monkeypatch):
+    monkeypatch.setenv('USUARIOS_AUTORIZADOS', '123456789, 987654321 ')
+    instancia = bot.BotDeGastos()
+    assert instancia.gente_permitida == {'123456789', '987654321', '8592224025'}
+
+
+def test_segundo_usuario_puede_cargar_gasto(almacen, monkeypatch):
+    monkeypatch.setenv('USUARIOS_AUTORIZADOS', '123456789')
+    update, context = entorno(almacen, monkeypatch, 'comida 1400 desayuno', usuario=8592224025)
+    almacen.gente_permitida = bot.cargar_usuarios_autorizados()
+    assert asyncio.run(bot.leer_mensaje_al_toque(update, context)) == bot.ConversationHandler.END
+    assert len(almacen._hojas['Gastos'].registros) == 1
+    assert almacen._hojas['Gastos'].registros[0]['Monto'] == 1400
+
+
+def test_ajeno_no_obtiene_acceso_al_agregar_segundo_usuario(almacen, monkeypatch):
+    monkeypatch.setenv('USUARIOS_AUTORIZADOS', '123456789')
+    update, context = entorno(almacen, monkeypatch, 'comida 1400 desayuno', usuario=222222222)
+    almacen.gente_permitida = bot.cargar_usuarios_autorizados()
+    assert asyncio.run(bot.leer_mensaje_al_toque(update, context)) == bot.ConversationHandler.END
+    assert not almacen._hojas['Gastos'].registros
+    assert 'Acceso denegado' in update.message.reply_text.call_args.args[0]
